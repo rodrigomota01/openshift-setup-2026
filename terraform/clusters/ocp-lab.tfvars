@@ -22,7 +22,7 @@ rhcos_iso = "local:iso/rhcos-4.16.1-x86_64-live.x86_64.iso"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bastion — usa clone do template (Linux normal, cloud-init funciona)
-# IP: 192.168.100.1 (eth1 — configurado manualmente no SO após o clone)
+# IP: 192.168.100.110 (eth1 — configurado manualmente no SO após o clone)
 # ─────────────────────────────────────────────────────────────────────────────
 vms = {
   "bastion-ocp" = {
@@ -30,7 +30,7 @@ vms = {
     cores  = 2
     memory = 4096
     disk   = 50
-    ip     = "192.168.100.1/24"
+    ip     = "192.168.100.110/24"
     vmid   = 2000
   }
 }
@@ -52,7 +52,7 @@ rhcos_vms = {
     cores  = 4
     memory = 8192
     disk   = 120
-    ip     = "192.168.100.10/24"
+    ip     = "192.168.100.111/24"
     vmid   = 2001
   }
 
@@ -62,7 +62,7 @@ rhcos_vms = {
     cores  = 4
     memory = 16384
     disk   = 120
-    ip     = "192.168.100.11/24"
+    ip     = "192.168.100.112/24"
     vmid   = 2011
   }
   "master-1" = {
@@ -70,7 +70,7 @@ rhcos_vms = {
     cores  = 4
     memory = 16384
     disk   = 120
-    ip     = "192.168.100.12/24"
+    ip     = "192.168.100.113/24"
     vmid   = 2012
   }
   "master-2" = {
@@ -78,7 +78,7 @@ rhcos_vms = {
     cores  = 4
     memory = 16384
     disk   = 120
-    ip     = "192.168.100.13/24"
+    ip     = "192.168.100.114/24"
     vmid   = 2013
   }
 
@@ -88,7 +88,7 @@ rhcos_vms = {
     cores  = 2
     memory = 8192
     disk   = 120
-    ip     = "192.168.100.21/24"
+    ip     = "192.168.100.115/24"
     vmid   = 2021
   }
   "worker-1" = {
@@ -96,7 +96,7 @@ rhcos_vms = {
     cores  = 2
     memory = 8192
     disk   = 120
-    ip     = "192.168.100.22/24"
+    ip     = "192.168.100.116/24"
     vmid   = 2022
   }
 
@@ -106,7 +106,7 @@ rhcos_vms = {
     cores  = 4
     memory = 16384
     disk   = 120
-    ip     = "192.168.100.31/24"
+    ip     = "192.168.100.117/24"
     vmid   = 2031
   }
   "infra-1" = {
@@ -114,7 +114,7 @@ rhcos_vms = {
     cores  = 4
     memory = 16384
     disk   = 120
-    ip     = "192.168.100.32/24"
+    ip     = "192.168.100.118/24"
     vmid   = 2032
   }
 }
