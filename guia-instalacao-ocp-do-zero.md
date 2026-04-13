@@ -2,6 +2,9 @@
 
 **Topologia:** 3 masters · 2 workers · 2 infra  
 **Método:** UPI (User Provisioned Infrastructure)  
+**Infraestrutura:** Proxmox VE  
+**DNS:** dnsmasq no bastion (sem servidor DNS externo)  
+**Acesso externo:** 1 IP público → Ingress/rotas (via sslip.io como baseDomain)  
 **Objetivo:** Aprendizado — instalação completa e configuração pós-instalação  
 **Data de criação:** 2026-04-13  
 
@@ -9,248 +12,416 @@
 
 ## Sumário
 
-1. [Visão Geral da Arquitetura](#1-visão-geral-da-arquitetura)
-2. [Requisitos de Infraestrutura](#2-requisitos-de-infraestrutura)
-3. [Pré-Requisitos de Rede](#3-pré-requisitos-de-rede)
-4. [Preparação do Bastion Host](#4-preparação-do-bastion-host)
-5. [Configuração de DNS](#5-configuração-de-dns)
+1. [Arquitetura do Cenário](#1-arquitetura-do-cenário)
+2. [Rede no Proxmox](#2-rede-no-proxmox)
+3. [Criação das VMs no Proxmox](#3-criação-das-vms-no-proxmox)
+4. [Configuração do Bastion como Gateway NAT](#4-configuração-do-bastion-como-gateway-nat)
+5. [Configuração de DNS com dnsmasq](#5-configuração-de-dns-com-dnsmasq)
 6. [Configuração do Load Balancer (HAProxy)](#6-configuração-do-load-balancer-haproxy)
-7. [Geração dos Manifestos de Instalação](#7-geração-dos-manifestos-de-instalação)
-8. [Bootstrap e Instalação do Cluster](#8-bootstrap-e-instalação-do-cluster)
-9. [Configuração dos Nodes Infra](#9-configuração-dos-nodes-infra)
-10. [Migração de Workloads de Infra](#10-migração-de-workloads-de-infra)
-11. [Validação Final do Cluster](#11-validação-final-do-cluster)
-12. [Comandos de Referência Rápida](#12-comandos-de-referência-rápida)
+7. [Preparação do Bastion — Ferramentas OCP](#7-preparação-do-bastion--ferramentas-ocp)
+8. [Geração dos Manifestos de Instalação](#8-geração-dos-manifestos-de-instalação)
+9. [Bootstrap e Instalação do Cluster](#9-bootstrap-e-instalação-do-cluster)
+10. [Configuração dos Nodes Infra](#10-configuração-dos-nodes-infra)
+11. [Migração de Workloads de Infra](#11-migração-de-workloads-de-infra)
+12. [Validação Final do Cluster](#12-validação-final-do-cluster)
+13. [Comandos de Referência Rápida](#13-comandos-de-referência-rápida)
 
 ---
 
-## 1. Visão Geral da Arquitetura
+## 1. Arquitetura do Cenário
 
-### 1.1 Topologia de Nodes
-
-| Role    | Qtd | Hostname exemplo         | Função                                  |
-|---------|-----|--------------------------|-----------------------------------------|
-| master  | 3   | master-0/1/2             | etcd + API Server + Control Plane       |
-| worker  | 2   | worker-0/1               | Workloads de aplicação                  |
-| infra   | 2   | infra-0/1                | Router (Ingress) + Registry + Monitoring|
-| bastion | 1   | bastion                  | Instalação, acesso SSH, oc CLI          |
-
-> Os nodes **infra** são tecnicamente workers com um `MachineConfigPool` e `taint` dedicados.  
-> Eles existem para isolar componentes da plataforma (Ingress, Registry, Monitoring) dos workloads de aplicação.
-
-### 1.2 Diagrama de Rede (simplificado)
+### 1.1 Visão geral
 
 ```
-Internet / Rede Corporativa
-         |
-    [ Load Balancer ]
-     /            \
-  :6443          :443 / :80
-(API)          (Ingress/Apps)
-   |                  |
-[masters x3]    [infra x2]
-                      |
-               [workers x2]
+┌─────────────────────────────────────────────────────────────────┐
+│  PROXMOX HOST                                                   │
+│                                                                 │
+│  vmbr0 (internet/management)     vmbr1 (rede interna cluster)  │
+│  SEU_IP_PUBLICO                  192.168.100.0/24              │
+│         │                               │                       │
+│  ┌──────┴──────────────────────────────┴──────┐               │
+│  │  BASTION VM                                 │               │
+│  │  eth0: SEU_IP_PUBLICO (ou NAT)             │               │
+│  │  eth1: 192.168.100.1 (gateway + DNS + LB)  │               │
+│  └─────────────────────────────────────────────┘               │
+│                        │ vmbr1                                  │
+│          ┌─────────────┼─────────────┐                         │
+│          │             │             │                         │
+│    [master x3]   [worker x2]   [infra x2]                     │
+│    .11/.12/.13   .21/.22        .31/.32                        │
+│    (só vmbr1)    (só vmbr1)    (só vmbr1)                      │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 Portas necessárias
+**Fluxo de acesso externo:**
+- `*.apps.ocp.SEU_IP_PUBLICO.sslip.io` → resolve via **sslip.io** para SEU_IP_PUBLICO
+  → HAProxy bastion → porta 80/443 → infra nodes
+- `api.ocp.SEU_IP_PUBLICO.sslip.io` → HAProxy bastion → porta 6443 → masters
 
-| Porta     | Protocolo | Origem        | Destino    | Função                  |
-|-----------|-----------|---------------|------------|-------------------------|
-| 6443      | TCP       | Externos/LB   | Masters    | Kubernetes API          |
-| 22623     | TCP       | Bastion/LB    | Masters    | Machine Config Server   |
-| 443/80    | TCP       | Externos/LB   | Infra      | Ingress Controller      |
-| 2379-2380 | TCP       | Masters       | Masters    | etcd (cluster interno)  |
-| 9000-9999 | TCP/UDP   | Todos nodes   | Todos      | Host services           |
-| 10250     | TCP       | Masters       | Workers    | Kubelet                 |
-| 4789/8472 | UDP       | Todos nodes   | Todos      | OVN-Kubernetes (SDN)    |
+**Por que sslip.io como baseDomain?**  
+O `sslip.io` é um serviço DNS público que resolve automaticamente qualquer hostname que
+contenha um IP. Exemplo: `algo.192.168.1.5.sslip.io` → `192.168.1.5`. Isso elimina a
+necessidade de registrar um domínio ou configurar DNS externo para as rotas de apps.
+
+> Substitua `SEU_IP_PUBLICO` em todo este guia pelo seu IP público real (ex: `203.0.113.50`).
+
+### 1.2 Topologia de Nodes
+
+| Role    | Qtd | IP interno      | Hostname base              |
+|---------|-----|-----------------|----------------------------|
+| bastion | 1   | 192.168.100.1   | bastion (gateway + DNS + LB)|
+| bootstrap| 1  | 192.168.100.10  | bootstrap                  |
+| master  | 3   | .11 / .12 / .13 | master-0 / 1 / 2           |
+| worker  | 2   | .21 / .22       | worker-0 / 1               |
+| infra   | 2   | .31 / .32       | infra-0 / 1                |
+
+> Os nodes RHCOS **não têm acesso direto à internet** — usam o bastion como gateway NAT.
+
+### 1.3 Portas que o bastion precisa escutar
+
+| Porta  | IP               | Direção     | Função                          |
+|--------|------------------|-------------|---------------------------------|
+| 53     | 192.168.100.1    | interna     | dnsmasq — DNS dos nodes         |
+| 80     | SEU_IP_PUBLICO   | externa     | Ingress HTTP                    |
+| 443    | SEU_IP_PUBLICO   | externa     | Ingress HTTPS                   |
+| 6443   | SEU_IP_PUBLICO   | externa     | API (acesso externo / oc CLI)   |
+| 6443   | 192.168.100.1    | interna     | API (acesso dos nodes)          |
+| 22623  | 192.168.100.1    | interna     | Machine Config Server           |
+| 80     | 192.168.100.1    | interna     | Servidor HTTP — ignition files  |
 
 ---
 
-## 2. Requisitos de Infraestrutura
+## 2. Rede no Proxmox
 
-### 2.1 Especificações mínimas de recursos
+### 2.1 Criar a bridge interna `vmbr1`
 
-| Node    | vCPU | RAM   | Disco OS | Disco extra |
-|---------|------|-------|----------|-------------|
-| bastion | 2    | 4 GB  | 50 GB    | —           |
-| master  | 4    | 16 GB | 120 GB   | —           |
-| worker  | 2    | 8 GB  | 120 GB   | —           |
-| infra   | 4    | 16 GB | 120 GB   | —           |
-
-> Para ambiente de laboratório, masters podem usar 4 vCPU / 8 GB, mas não é recomendado em produção.
-
-### 2.2 Sistema Operacional
-
-- **Bastion:** RHEL 8 ou 9 (ou CentOS Stream 9)
-- **Todos os outros nodes:** RHCOS (Red Hat CoreOS) — provisionado automaticamente pelo instalador
-
-### 2.3 Planejamento de IPs
-
-Preencha antes de iniciar:
-
-| Node       | IP            | Hostname FQDN                        |
-|------------|---------------|--------------------------------------|
-| bastion    | 192.168.1.10  | bastion.ocp.example.com              |
-| bootstrap  | 192.168.1.20  | bootstrap.ocp.example.com            |
-| master-0   | 192.168.1.21  | master-0.ocp.example.com             |
-| master-1   | 192.168.1.22  | master-1.ocp.example.com             |
-| master-2   | 192.168.1.23  | master-2.ocp.example.com             |
-| worker-0   | 192.168.1.31  | worker-0.ocp.example.com             |
-| worker-1   | 192.168.1.32  | worker-1.ocp.example.com             |
-| infra-0    | 192.168.1.41  | infra-0.ocp.example.com              |
-| infra-1    | 192.168.1.42  | infra-1.ocp.example.com              |
-| LB API     | 192.168.1.100 | api.ocp.example.com                  |
-| LB Ingress | 192.168.1.101 | *.apps.ocp.example.com               |
-
-> Substitua `ocp.example.com` pelo seu domínio de cluster.  
-> `cluster_name` = `ocp` | `base_domain` = `example.com`
-
----
-
-## 3. Pré-Requisitos de Rede
-
-### 3.1 Entradas DNS obrigatórias
-
-O DNS é o requisito mais crítico. Sem ele correto, a instalação falha.
-
-**Registros A (forward)**
+No host Proxmox, edite `/etc/network/interfaces` e adicione:
 
 ```
-api.ocp.example.com.          IN A  192.168.1.100   # VIP do LB — API
-api-int.ocp.example.com.      IN A  192.168.1.100   # Interno (mesmo IP do api)
-*.apps.ocp.example.com.       IN A  192.168.1.101   # Wildcard — Ingress
-
-bootstrap.ocp.example.com.    IN A  192.168.1.20
-master-0.ocp.example.com.     IN A  192.168.1.21
-master-1.ocp.example.com.     IN A  192.168.1.22
-master-2.ocp.example.com.     IN A  192.168.1.23
-worker-0.ocp.example.com.     IN A  192.168.1.31
-worker-1.ocp.example.com.     IN A  192.168.1.32
-infra-0.ocp.example.com.      IN A  192.168.1.41
-infra-1.ocp.example.com.      IN A  192.168.1.42
+# Bridge interna para o cluster OCP — sem gateway, sem acesso externo direto
+auto vmbr1
+iface vmbr1 inet static
+    address 192.168.100.1/24
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+    # Sem gateway — o bastion fará NAT para esta rede
 ```
 
-**Registros PTR (reverse)**
-
-```
-20.1.168.192.in-addr.arpa.   IN PTR bootstrap.ocp.example.com.
-21.1.168.192.in-addr.arpa.   IN PTR master-0.ocp.example.com.
-22.1.168.192.in-addr.arpa.   IN PTR master-1.ocp.example.com.
-23.1.168.192.in-addr.arpa.   IN PTR master-2.ocp.example.com.
-31.1.168.192.in-addr.arpa.   IN PTR worker-0.ocp.example.com.
-32.1.168.192.in-addr.arpa.   IN PTR worker-1.ocp.example.com.
-41.1.168.192.in-addr.arpa.   IN PTR infra-0.ocp.example.com.
-42.1.168.192.in-addr.arpa.   IN PTR infra-1.ocp.example.com.
-```
-
-### 3.2 Validação do DNS (rodar do bastion)
+Aplique sem reiniciar:
 
 ```bash
-# Testar resolução forward
-dig api.ocp.example.com +short
-dig api-int.ocp.example.com +short
-dig test.apps.ocp.example.com +short
-
-# Testar resolução reversa
-dig -x 192.168.1.21 +short   # deve retornar master-0.ocp.example.com
-
-# Testar todos os masters
-for i in 21 22 23; do dig -x 192.168.1.$i +short; done
+# No host Proxmox
+ifreload -a
+# ou
+ifup vmbr1
 ```
+
+Verifique:
+
+```bash
+ip addr show vmbr1
+# deve mostrar 192.168.100.1/24
+```
+
+> `vmbr0` continua sendo a bridge de management/internet do Proxmox host (existente).  
+> O IP `192.168.100.1` no `vmbr1` é do **host Proxmox**, mas o bastion VM vai ter  
+> esse mesmo IP como interface interna — configure apenas um dos dois, ou use `.1` no  
+> bastion e outro IP no host se precisar.  
+> **Recomendação:** deixe o IP `192.168.100.1/24` no `vmbr1` do bastion VM;  
+> no host Proxmox, não atribua IP à vmbr1 (deixe só como bridge).
+
+### 2.2 Bridge corrigida para o host (sem IP no host)
+
+```
+auto vmbr1
+iface vmbr1 inet manual
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+```
+
+Assim, apenas o bastion VM terá o IP `192.168.100.1` nessa rede.
 
 ---
 
-## 4. Preparação do Bastion Host
+## 3. Criação das VMs no Proxmox
 
-### 4.1 Instalação de ferramentas
+### 3.1 Baixar as ISOs necessárias
+
+No host Proxmox, baixe para o storage de ISOs (ex: `/var/lib/vz/template/iso/`):
 
 ```bash
-# Baixar o OpenShift installer e oc CLI
-# Obtenha o link em: https://console.redhat.com/openshift/install
-# Selecione: Bare Metal > User-provisioned infrastructure
+# RHCOS — alinha com a versão OCP que você vai instalar
+# Acesse: https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.16/latest/
+# Baixe o arquivo: rhcos-4.16.x-x86_64-live.x86_64.iso
 
-OCP_VERSION="4.16.x"   # substitua pela versão desejada
+# RHEL/CentOS Stream 9 — para o bastion
+# Baixe: CentOS-Stream-9-latest-x86_64-dvd1.iso
+```
 
-tar -xvf openshift-install-linux.tar.gz
-tar -xvf openshift-client-linux.tar.gz
+### 3.2 Especificações das VMs
 
-sudo mv oc kubectl openshift-install /usr/local/bin/
-sudo chmod +x /usr/local/bin/{oc,kubectl,openshift-install}
+| VM          | vCPU | RAM    | Disco  | Bridge(s)         | Boot           |
+|-------------|------|--------|--------|-------------------|----------------|
+| bastion     | 2    | 4 GB   | 50 GB  | vmbr0 + vmbr1     | ISO CentOS/RHEL|
+| bootstrap   | 4    | 8 GB   | 120 GB | vmbr1             | ISO RHCOS      |
+| master-0/1/2| 4    | 16 GB  | 120 GB | vmbr1             | ISO RHCOS      |
+| worker-0/1  | 2    | 8 GB   | 120 GB | vmbr1             | ISO RHCOS      |
+| infra-0/1   | 4    | 16 GB  | 120 GB | vmbr1             | ISO RHCOS      |
+
+> Para lab com poucos recursos: masters podem usar 4 vCPU / 8 GB.
+
+### 3.3 Criar VMs via CLI do Proxmox (qm)
+
+**Exemplo — bastion:**
+
+```bash
+# No host Proxmox
+VMID=100
+qm create $VMID \
+  --name bastion \
+  --memory 4096 \
+  --cores 2 \
+  --net0 virtio,bridge=vmbr0 \
+  --net1 virtio,bridge=vmbr1 \
+  --scsi0 local-lvm:50 \
+  --ide2 local:iso/CentOS-Stream-9-latest-x86_64-dvd1.iso,media=cdrom \
+  --boot order=ide2 \
+  --ostype l26
+qm start $VMID
+```
+
+**Exemplo — master-0 (repita para master-1, master-2):**
+
+```bash
+VMID=111   # 111=master-0, 112=master-1, 113=master-2
+qm create $VMID \
+  --name master-0 \
+  --memory 16384 \
+  --cores 4 \
+  --net0 virtio,bridge=vmbr1 \
+  --scsi0 local-lvm:120 \
+  --ide2 local:iso/rhcos-4.16-live.x86_64.iso,media=cdrom \
+  --boot order=ide2 \
+  --ostype l26
+# NÃO inicie ainda — aguarde a seção de bootstrap
+```
+
+**Exemplo — worker-0 / worker-1:**
+
+```bash
+VMID=121   # 121=worker-0, 122=worker-1
+qm create $VMID \
+  --name worker-0 \
+  --memory 8192 \
+  --cores 2 \
+  --net0 virtio,bridge=vmbr1 \
+  --scsi0 local-lvm:120 \
+  --ide2 local:iso/rhcos-4.16-live.x86_64.iso,media=cdrom \
+  --boot order=ide2 \
+  --ostype l26
+```
+
+**Exemplo — infra-0 / infra-1:**
+
+```bash
+VMID=131   # 131=infra-0, 132=infra-1
+qm create $VMID \
+  --name infra-0 \
+  --memory 16384 \
+  --cores 4 \
+  --net0 virtio,bridge=vmbr1 \
+  --scsi0 local-lvm:120 \
+  --ide2 local:iso/rhcos-4.16-live.x86_64.iso,media=cdrom \
+  --boot order=ide2 \
+  --ostype l26
+```
+
+### 3.4 Identificar as interfaces de rede nas VMs RHCOS
+
+As VMs RHCOS com `virtio` normalmente enxergam a interface como `ens3` ou `enp6s18`.  
+Para confirmar, ao bootar pela ISO RHCOS interativamente, rode:
+
+```bash
+ip link
+```
+
+Ajuste o nome da interface nos parâmetros de boot na seção 9.
+
+---
+
+## 4. Configuração do Bastion como Gateway NAT
+
+O bastion precisa fazer NAT para que os nodes RHCOS (que só têm interface interna)
+consigam acessar a internet — necessário para pull de imagens de container.
+
+### 4.1 Instalar o bastion (CentOS Stream 9 / RHEL 9)
+
+Instale o SO no bastion via ISO. Configure:
+- **eth0** (vmbr0): IP obtido por DHCP ou IP do seu ambiente de management
+- **eth1** (vmbr1): IP estático `192.168.100.1/24` — gateway da rede interna
+
+```bash
+# Configurar eth1 com IP estático no bastion
+sudo nmcli con add type ethernet con-name eth1-internal ifname eth1 \
+  ip4 192.168.100.1/24
+
+sudo nmcli con up eth1-internal
+```
+
+### 4.2 Ativar IP forwarding e NAT
+
+```bash
+# Habilitar IP forwarding permanentemente
+echo "net.ipv4.ip_forward = 1" | sudo tee /etc/sysctl.d/99-ip-forward.conf
+sudo sysctl -p /etc/sysctl.d/99-ip-forward.conf
+
+# Configurar NAT (masquerade) — substitua eth0 pela interface com saída para internet
+sudo firewall-cmd --permanent --zone=external --add-masquerade
+sudo firewall-cmd --permanent --zone=external --add-interface=eth0
+sudo firewall-cmd --permanent --zone=internal --add-interface=eth1
+sudo firewall-cmd --permanent --zone=internal --add-source=192.168.100.0/24
+sudo firewall-cmd --reload
 
 # Verificar
-oc version --client
-openshift-install version
+sudo firewall-cmd --zone=external --query-masquerade
+# deve retornar: yes
 ```
 
-### 4.2 Criar diretório de instalação
+### 4.3 Validar conectividade após NAT
+
+De um node RHCOS (após iniciar com ignition), valide:
 
 ```bash
-mkdir ~/ocp-install
-cd ~/ocp-install
-```
-
-### 4.3 Obter o Pull Secret
-
-1. Acesse: https://console.redhat.com/openshift/install
-2. Baixe seu **pull secret** (arquivo JSON)
-3. Salve em `~/ocp-install/pull-secret.txt`
-
-### 4.4 Gerar par de chaves SSH
-
-```bash
-ssh-keygen -t ed25519 -N '' -f ~/.ssh/ocp_id_ed25519
-cat ~/.ssh/ocp_id_ed25519.pub   # copie para usar no install-config.yaml
+# Do node — deve chegar na internet via bastion
+curl -s https://registry.redhat.io -o /dev/null -w "%{http_code}\n"
 ```
 
 ---
 
-## 5. Configuração de DNS
+## 5. Configuração de DNS com dnsmasq
 
-Se estiver usando o **bind/named** no bastion para laboratório:
+O `dnsmasq` resolve **todos** os nomes do cluster internamente.  
+Os nodes RHCOS são configurados para usar `192.168.100.1` (bastion) como DNS.
+
+### 5.1 Instalar dnsmasq
 
 ```bash
-sudo dnf install -y bind bind-utils
-
-# Editar /etc/named.conf — adicionar zona
-# Criar /var/named/ocp.example.com.zone (forward)
-# Criar /var/named/1.168.192.in-addr.arpa.zone (reverse)
-
-sudo systemctl enable --now named
-sudo firewall-cmd --add-service=dns --permanent
-sudo firewall-cmd --reload
+# No bastion
+sudo dnf install -y dnsmasq
 ```
 
-**Exemplo de zona forward** (`/var/named/ocp.example.com.zone`):
+### 5.2 Criar o arquivo de configuração
 
-```zone
-$TTL 300
-@   IN SOA  bastion.ocp.example.com. admin.example.com. (
-        2026041301 ; Serial
-        3600       ; Refresh
-        900        ; Retry
-        604800     ; Expire
-        300 )      ; Minimum TTL
-    IN NS   bastion.ocp.example.com.
+> Substitua `SEU_IP_PUBLICO` pelo IP público real em todo o bloco abaixo.  
+> Exemplo: se seu IP é `203.0.113.50`, o domínio será `ocp.203.0.113.50.sslip.io`
 
-bastion         IN A    192.168.1.10
-bootstrap       IN A    192.168.1.20
-master-0        IN A    192.168.1.21
-master-1        IN A    192.168.1.22
-master-2        IN A    192.168.1.23
-worker-0        IN A    192.168.1.31
-worker-1        IN A    192.168.1.32
-infra-0         IN A    192.168.1.41
-infra-1         IN A    192.168.1.42
+**`/etc/dnsmasq.d/ocp-cluster.conf`:**
 
-api             IN A    192.168.1.100
-api-int         IN A    192.168.1.100
-*.apps          IN A    192.168.1.101
+```ini
+# Interface de escuta — apenas rede interna
+interface=eth1
+bind-interfaces
+
+# Não usar resolv.conf do host para forward — upstream explícito
+no-resolv
+
+# Servidores upstream para nomes não resolvidos localmente
+server=8.8.8.8
+server=1.1.1.1
+
+# Domínio local do cluster
+domain=ocp.SEU_IP_PUBLICO.sslip.io
+
+# ──────────────────────────────────────────────────
+# API — resolve para o bastion (HAProxy interno)
+# ──────────────────────────────────────────────────
+address=/api.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.1
+address=/api-int.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.1
+
+# ──────────────────────────────────────────────────
+# Apps wildcard — resolve internamente para o bastion
+# (HAProxy redireciona para infra nodes na porta 80/443)
+# ──────────────────────────────────────────────────
+address=/.apps.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.1
+
+# ──────────────────────────────────────────────────
+# Nodes individuais
+# ──────────────────────────────────────────────────
+address=/bootstrap.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.10
+address=/master-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.11
+address=/master-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.12
+address=/master-2.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.13
+address=/worker-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.21
+address=/worker-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.22
+address=/infra-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.31
+address=/infra-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.32
+
+# ──────────────────────────────────────────────────
+# Registros PTR (reverse DNS) — obrigatório para OCP
+# ──────────────────────────────────────────────────
+ptr-record=10.100.168.192.in-addr.arpa,bootstrap.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=11.100.168.192.in-addr.arpa,master-0.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=12.100.168.192.in-addr.arpa,master-1.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=13.100.168.192.in-addr.arpa,master-2.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=21.100.168.192.in-addr.arpa,worker-0.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=22.100.168.192.in-addr.arpa,worker-1.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=31.100.168.192.in-addr.arpa,infra-0.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=32.100.168.192.in-addr.arpa,infra-1.ocp.SEU_IP_PUBLICO.sslip.io
+
+# Log de queries (útil para debug — comente em produção)
+log-queries
+log-facility=/var/log/dnsmasq.log
+```
+
+### 5.3 Ativar o dnsmasq
+
+```bash
+sudo systemctl enable --now dnsmasq
+
+# Abrir DNS apenas na interface interna
+sudo firewall-cmd --zone=internal --add-service=dns --permanent
+sudo firewall-cmd --reload
+
+# Verificar
+sudo systemctl status dnsmasq
+```
+
+### 5.4 Validar o DNS do bastion
+
+```bash
+# Instalar dig
+sudo dnf install -y bind-utils
+
+# Forward
+dig @192.168.100.1 api.ocp.SEU_IP_PUBLICO.sslip.io +short
+# deve retornar: 192.168.100.1
+
+dig @192.168.100.1 api-int.ocp.SEU_IP_PUBLICO.sslip.io +short
+# deve retornar: 192.168.100.1
+
+dig @192.168.100.1 console-openshift-console.apps.ocp.SEU_IP_PUBLICO.sslip.io +short
+# deve retornar: 192.168.100.1
+
+dig @192.168.100.1 master-0.ocp.SEU_IP_PUBLICO.sslip.io +short
+# deve retornar: 192.168.100.11
+
+# Reverse
+dig @192.168.100.1 -x 192.168.100.11 +short
+# deve retornar: master-0.ocp.SEU_IP_PUBLICO.sslip.io.
+
+# Upstream (internet) — confirma que o forward para 8.8.8.8 funciona
+dig @192.168.100.1 registry.redhat.io +short
 ```
 
 ---
 
 ## 6. Configuração do Load Balancer (HAProxy)
+
+O HAProxy roda no bastion e serve dois propósitos:
+- **Rede interna (192.168.100.1):** API + MCS para os nodes do cluster
+- **IP público (SEU_IP_PUBLICO):** Ingress HTTP/HTTPS + API para acesso externo
 
 ```bash
 sudo dnf install -y haproxy
@@ -272,7 +443,8 @@ defaults
     timeout server  1m
 
 #---------------------------------------------------------------------
-# API — porta 6443 (externa + interna)
+# API — porta 6443
+# Bind em TODAS as interfaces: acesso externo (oc CLI) e interno (nodes)
 #---------------------------------------------------------------------
 frontend api_frontend
     bind *:6443
@@ -281,28 +453,30 @@ frontend api_frontend
 backend api_backend
     balance roundrobin
     option tcp-check
-    server bootstrap  192.168.1.20:6443  check
-    server master-0   192.168.1.21:6443  check
-    server master-1   192.168.1.22:6443  check
-    server master-2   192.168.1.23:6443  check
+    server bootstrap  192.168.100.10:6443  check
+    server master-0   192.168.100.11:6443  check
+    server master-1   192.168.100.12:6443  check
+    server master-2   192.168.100.13:6443  check
 
 #---------------------------------------------------------------------
-# Machine Config Server — porta 22623 (bootstrap + masters)
+# Machine Config Server — porta 22623
+# Apenas rede interna (nodes precisam baixar config durante boot)
 #---------------------------------------------------------------------
 frontend mcs_frontend
-    bind *:22623
+    bind 192.168.100.1:22623
     default_backend mcs_backend
 
 backend mcs_backend
     balance roundrobin
     option tcp-check
-    server bootstrap  192.168.1.20:22623 check
-    server master-0   192.168.1.21:22623 check
-    server master-1   192.168.1.22:22623 check
-    server master-2   192.168.1.23:22623 check
+    server bootstrap  192.168.100.10:22623 check
+    server master-0   192.168.100.11:22623 check
+    server master-1   192.168.100.12:22623 check
+    server master-2   192.168.100.13:22623 check
 
 #---------------------------------------------------------------------
-# Ingress HTTP — porta 80 (infra nodes)
+# Ingress HTTP — porta 80
+# Bind em TODAS as interfaces: IP público recebe e encaminha para infra
 #---------------------------------------------------------------------
 frontend ingress_http_frontend
     bind *:80
@@ -311,11 +485,12 @@ frontend ingress_http_frontend
 backend ingress_http_backend
     balance roundrobin
     option tcp-check
-    server infra-0  192.168.1.41:80  check
-    server infra-1  192.168.1.42:80  check
+    server infra-0  192.168.100.31:80  check
+    server infra-1  192.168.100.32:80  check
 
 #---------------------------------------------------------------------
-# Ingress HTTPS — porta 443 (infra nodes)
+# Ingress HTTPS — porta 443
+# Bind em TODAS as interfaces: IP público recebe e encaminha para infra
 #---------------------------------------------------------------------
 frontend ingress_https_frontend
     bind *:443
@@ -324,44 +499,97 @@ frontend ingress_https_frontend
 backend ingress_https_backend
     balance roundrobin
     option tcp-check
-    server infra-0  192.168.1.41:443 check
-    server infra-1  192.168.1.42:443 check
+    server infra-0  192.168.100.31:443 check
+    server infra-1  192.168.100.32:443 check
 ```
 
 ```bash
+# Verificar sintaxe
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+
+# Habilitar e iniciar
 sudo systemctl enable --now haproxy
-sudo firewall-cmd --add-port={6443,22623,80,443}/tcp --permanent
+
+# Abrir portas no firewall — zona externa (IP público)
+sudo firewall-cmd --zone=external --add-port={6443,80,443}/tcp --permanent
+# Abrir MCS apenas na zona interna
+sudo firewall-cmd --zone=internal --add-port=22623/tcp --permanent
 sudo firewall-cmd --reload
 
-# Verificar
-sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+# Verificar se está escutando
+ss -tlnp | grep -E "6443|22623|:80|:443"
 ```
-
-> **Nota:** O bootstrap é removido do backend `api_backend` e `mcs_backend` após a instalação ser concluída.
 
 ---
 
-## 7. Geração dos Manifestos de Instalação
+## 7. Preparação do Bastion — Ferramentas OCP
 
-### 7.1 Criar o `install-config.yaml`
+### 7.1 Baixar o instalador e oc CLI
 
 ```bash
-cd ~/ocp-install
+# Acesse: https://console.redhat.com/openshift/install
+# Selecione: Bare Metal > User-provisioned infrastructure
+# Baixe: openshift-install-linux.tar.gz e openshift-client-linux.tar.gz
+
+tar -xvf openshift-install-linux.tar.gz
+tar -xvf openshift-client-linux.tar.gz
+
+sudo mv oc kubectl openshift-install /usr/local/bin/
+sudo chmod +x /usr/local/bin/{oc,kubectl,openshift-install}
+
+# Verificar — versões devem coincidir
+oc version --client
+openshift-install version
 ```
 
-**`install-config.yaml`:**
+### 7.2 Criar diretório de instalação e gerar chave SSH
+
+```bash
+mkdir ~/ocp-install
+cd ~/ocp-install
+
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/ocp_id_ed25519
+echo "Chave pública:"
+cat ~/.ssh/ocp_id_ed25519.pub
+```
+
+### 7.3 Obter o Pull Secret
+
+1. Acesse: https://console.redhat.com/openshift/install
+2. Copie ou baixe o **pull secret**
+3. Salve em `~/ocp-install/pull-secret.txt`
+
+### 7.4 Servidor HTTP para os arquivos Ignition
+
+```bash
+sudo dnf install -y httpd
+sudo systemctl enable --now httpd
+
+# Abrir porta 80 na zona interna (nodes precisam baixar ignition)
+sudo firewall-cmd --zone=internal --add-service=http --permanent
+sudo firewall-cmd --reload
+```
+
+---
+
+## 8. Geração dos Manifestos de Instalação
+
+### 8.1 Criar o `install-config.yaml`
+
+> Substitua `SEU_IP_PUBLICO` pelo IP público real.
 
 ```yaml
+# ~/ocp-install/install-config.yaml
 apiVersion: v1
-baseDomain: example.com                    # seu base domain
+baseDomain: SEU_IP_PUBLICO.sslip.io      # ex: 203.0.113.50.sslip.io
 metadata:
-  name: ocp                                # cluster name
+  name: ocp                               # cluster name → ocp.SEU_IP_PUBLICO.sslip.io
 
 compute:
   - architecture: amd64
     hyperthreading: Enabled
     name: worker
-    replicas: 0                            # workers provisionados manualmente (UPI)
+    replicas: 0                           # UPI: workers criados manualmente
 
 controlPlane:
   architecture: amd64
@@ -374,151 +602,164 @@ networking:
     - cidr: 10.128.0.0/14
       hostPrefix: 23
   machineNetwork:
-    - cidr: 192.168.1.0/24               # sua rede de nodes
+    - cidr: 192.168.100.0/24             # rede interna dos nodes no Proxmox
   networkType: OVNKubernetes
   serviceNetwork:
     - 172.30.0.0/16
 
 platform:
-  none: {}                                 # UPI = none
+  none: {}                                # UPI obrigatório
 
 fips: false
 
-pullSecret: |
-  <COLE_SEU_PULL_SECRET_AQUI>
+pullSecret: '<COLE_SEU_PULL_SECRET_AQUI>'
 
-sshKey: |
-  <COLE_SUA_CHAVE_PUBLICA_SSH_AQUI>
+sshKey: '<COLE_SUA_CHAVE_PUBLICA_SSH_AQUI>'
 ```
 
-### 7.2 Fazer backup do install-config (será consumido)
+### 8.2 Backup e geração dos manifestos
 
 ```bash
+cd ~/ocp-install
+
+# Backup obrigatório — o instalador consome e apaga o install-config.yaml
 cp install-config.yaml install-config.yaml.bak
-```
 
-### 7.3 Gerar manifestos
-
-```bash
+# Gerar manifestos
 openshift-install create manifests --dir ~/ocp-install/
 
-# Remover manifestos de Machine que criariam workers automaticamente
+# Remover MachineSet de workers automáticos (UPI = provisionamento manual)
 rm -f ~/ocp-install/openshift/99_openshift-cluster-api_worker-machineset-*.yaml
-```
 
-### 7.4 Gerar Ignition configs
-
-```bash
+# Gerar arquivos Ignition
 openshift-install create ignition-configs --dir ~/ocp-install/
 
-ls -la ~/ocp-install/
-# Você verá: bootstrap.ign, master.ign, worker.ign, auth/
+ls -lh ~/ocp-install/
+# bootstrap.ign  master.ign  worker.ign  auth/
 ```
 
-### 7.5 Hospedar os arquivos Ignition via HTTP
+### 8.3 Publicar os Ignition via HTTP
 
 ```bash
-sudo dnf install -y httpd
 sudo cp ~/ocp-install/*.ign /var/www/html/
 sudo chmod 644 /var/www/html/*.ign
-sudo systemctl enable --now httpd
-sudo firewall-cmd --add-service=http --permanent
-sudo firewall-cmd --reload
+sudo restorecon -Rv /var/www/html/
 
-# Teste
-curl http://192.168.1.10/bootstrap.ign | head -c 200
+# Testar
+curl http://192.168.100.1/bootstrap.ign | python3 -m json.tool | head -5
 ```
 
 ---
 
-## 8. Bootstrap e Instalação do Cluster
+## 9. Bootstrap e Instalação do Cluster
 
-### 8.1 Baixar a ISO do RHCOS
+### 9.1 Entender os parâmetros de boot do RHCOS
 
-```bash
-# Obtenha a URL da versão correta em:
-# https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/
+Ao iniciar cada VM pela ISO do RHCOS, no menu GRUB pressione `e` para editar e adicione
+na linha `linux` (após `quiet`):
 
-RHCOS_VERSION="4.16.x"   # alinhe com a versão do OCP
-# Baixe a ISO e o raw image (para bare metal / VM)
-```
-
-### 8.2 Ordem de boot dos nodes
-
-**Siga esta ordem rigorosamente:**
-
-```
-1. Bootstrap     → boot pela ISO RHCOS → aponta para bootstrap.ign
-2. master-0      → boot pela ISO RHCOS → aponta para master.ign
-3. master-1      → boot pela ISO RHCOS → aponta para master.ign
-4. master-2      → boot pela ISO RHCOS → aponta para master.ign
-```
-
-> Workers e infra são iniciados **depois** que o control plane estiver operacional.
-
-### 8.3 Instalação via parâmetro de boot (RHCOS ISO)
-
-No boot loader (GRUB) do RHCOS, adicione os parâmetros:
-
-**Para Bootstrap:**
 ```
 coreos.inst.install_dev=/dev/sda
-coreos.inst.ignition_url=http://192.168.1.10/bootstrap.ign
-ip=192.168.1.20::192.168.1.1:255.255.255.0:bootstrap.ocp.example.com:ens3:none
-nameserver=192.168.1.10
+coreos.inst.ignition_url=http://192.168.100.1/<arquivo>.ign
+ip=<IP_NODE>::192.168.100.1:255.255.255.0:<HOSTNAME>:<INTERFACE>:none
+nameserver=192.168.100.1
 ```
 
-**Para Masters (ajuste o IP e hostname):**
+> `<INTERFACE>`: geralmente `ens3` ou `enp6s18` em VMs Proxmox com virtio.  
+> Confirme antes com `ip link` na ISO live.
+
+### 9.2 Ordem de boot — siga rigorosamente
+
+```
+Passo 1: Bootstrap   (bootstrap.ign)
+Passo 2: master-0    (master.ign)
+Passo 3: master-1    (master.ign)
+Passo 4: master-2    (master.ign)
+--- aguardar bootstrap completar ---
+Passo 5: worker-0    (worker.ign)
+Passo 6: worker-1    (worker.ign)
+Passo 7: infra-0     (worker.ign)
+Passo 8: infra-1     (worker.ign)
+```
+
+### 9.3 Parâmetros de boot por node
+
+**Bootstrap:**
 ```
 coreos.inst.install_dev=/dev/sda
-coreos.inst.ignition_url=http://192.168.1.10/master.ign
-ip=192.168.1.21::192.168.1.1:255.255.255.0:master-0.ocp.example.com:ens3:none
-nameserver=192.168.1.10
+coreos.inst.ignition_url=http://192.168.100.1/bootstrap.ign
+ip=192.168.100.10::192.168.100.1:255.255.255.0:bootstrap.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+nameserver=192.168.100.1
 ```
 
-### 8.4 Monitorar o bootstrap
-
-```bash
-# Do bastion, acompanhe o progresso
-openshift-install wait-for bootstrap-complete \
-  --dir ~/ocp-install/ \
-  --log-level=info
-
-# Em caso de dúvida, acompanhe os logs do bootstrap diretamente:
-ssh -i ~/.ssh/ocp_id_ed25519 core@192.168.1.20 \
-  "journalctl -b -f -u release-image.service -u bootkube.service"
+**master-0:**
+```
+coreos.inst.install_dev=/dev/sda
+coreos.inst.ignition_url=http://192.168.100.1/master.ign
+ip=192.168.100.11::192.168.100.1:255.255.255.0:master-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+nameserver=192.168.100.1
 ```
 
-> O bootstrap leva entre 15-30 minutos. Quando concluir, você verá:
-> `Bootstrap complete! The workers may now be deployed.`
-
-### 8.5 Iniciar Workers e Infra nodes
-
-Após o bootstrap completar, inicie os nodes worker e infra com o Ignition de worker:
-
-**Para Workers:**
+**master-1:**
 ```
-coreos.inst.ignition_url=http://192.168.1.10/worker.ign
-ip=192.168.1.31::192.168.1.1:255.255.255.0:worker-0.ocp.example.com:ens3:none
+ip=192.168.100.12::192.168.100.1:255.255.255.0:master-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
 ```
 
-**Para Infra (usam o mesmo ignition de worker inicialmente):**
+**master-2:**
 ```
-coreos.inst.ignition_url=http://192.168.1.10/worker.ign
-ip=192.168.1.41::192.168.1.1:255.255.255.0:infra-0.ocp.example.com:ens3:none
+ip=192.168.100.13::192.168.100.1:255.255.255.0:master-2.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
 ```
 
-### 8.6 Aprovar os CSRs dos nodes
+**worker-0:**
+```
+coreos.inst.ignition_url=http://192.168.100.1/worker.ign
+ip=192.168.100.21::192.168.100.1:255.255.255.0:worker-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+nameserver=192.168.100.1
+```
 
-Após os nodes subirem, eles precisam ter seus CSRs aprovados:
+**worker-1:**
+```
+ip=192.168.100.22::192.168.100.1:255.255.255.0:worker-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+```
+
+**infra-0** (usa worker.ign):
+```
+coreos.inst.ignition_url=http://192.168.100.1/worker.ign
+ip=192.168.100.31::192.168.100.1:255.255.255.0:infra-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+nameserver=192.168.100.1
+```
+
+**infra-1:**
+```
+ip=192.168.100.32::192.168.100.1:255.255.255.0:infra-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+```
+
+### 9.4 Monitorar o bootstrap
 
 ```bash
 export KUBECONFIG=~/ocp-install/auth/kubeconfig
 
-# Verificar CSRs pendentes (rode 2x, pois há 2 rounds de CSRs)
+openshift-install wait-for bootstrap-complete \
+  --dir ~/ocp-install/ \
+  --log-level=info
+
+# Se travar, inspecione diretamente:
+ssh -i ~/.ssh/ocp_id_ed25519 core@192.168.100.10 \
+  "journalctl -b -f -u release-image.service -u bootkube.service"
+```
+
+> Aguarde a mensagem: `Bootstrap complete! The workers may now be deployed.`  
+> O processo leva **15-30 minutos** dependendo da velocidade de download das imagens.
+
+### 9.5 Aprovar os CSRs dos nodes
+
+Após o bootstrap completar e os nodes worker/infra subirem:
+
+```bash
+# Listar CSRs
 oc get csr
 
-# Aprovar todos os CSRs pendentes
+# Aprovar todos de uma vez (execute 2x — há dois rounds de CSRs por node)
 oc get csr -o go-template='{{range .items}}{{if not .status.certificate}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' \
   | xargs oc adm certificate approve
 
@@ -526,7 +767,7 @@ oc get csr -o go-template='{{range .items}}{{if not .status.certificate}}{{.meta
 oc get nodes
 ```
 
-### 8.7 Aguardar a instalação completar
+### 9.6 Aguardar instalação completar
 
 ```bash
 openshift-install wait-for install-complete \
@@ -534,37 +775,42 @@ openshift-install wait-for install-complete \
   --log-level=info
 ```
 
-> Ao final, você receberá a URL do console e as credenciais do `kubeadmin`.
-
-### 8.8 Remover o bootstrap do Load Balancer
-
-Após `install-complete`, edite o HAProxy e **comente ou remova** o bootstrap:
-
-```haproxy
-backend api_backend
-    # server bootstrap  192.168.1.20:6443  check   ← comentar/remover
-    server master-0   192.168.1.21:6443  check
-    ...
-
-backend mcs_backend
-    # server bootstrap  192.168.1.20:22623 check   ← comentar/remover
-    ...
+Ao finalizar, você receberá:
+```
+INFO Install complete!
+INFO To access the cluster as the system:admin user when using 'oc', run
+INFO     export KUBECONFIG=/root/ocp-install/auth/kubeconfig
+INFO Access the OpenShift web-console here: https://console-openshift-console.apps.ocp.SEU_IP_PUBLICO.sslip.io
+INFO Login to the console with user: kubeadmin, and password: <SENHA>
 ```
 
+### 9.7 Remover o bootstrap do HAProxy
+
+Após `install-complete`:
+
 ```bash
+sudo vi /etc/haproxy/haproxy.cfg
+# Comente ou remova as linhas do bootstrap nos backends api e mcs:
+#   server bootstrap  192.168.100.10:6443  check
+#   server bootstrap  192.168.100.10:22623 check
+
 sudo systemctl reload haproxy
+
+# Opcional: desligar a VM do bootstrap
+qm stop 110 && qm destroy 110   # ajuste o VMID
 ```
 
 ---
 
-## 9. Configuração dos Nodes Infra
+## 10. Configuração dos Nodes Infra
 
-Os nodes **infra** são workers com label, taint e MachineConfigPool próprios. Isso garante que workloads de aplicação não sejam agendados neles.
+Os nodes **infra** são workers promovidos — recebem label, taint e MachineConfigPool
+próprios para isolar os componentes da plataforma das cargas de trabalho.
 
-### 9.1 Criar o MachineConfigPool `infra`
+### 10.1 Criar o MachineConfigPool `infra`
 
-```yaml
-# mcp-infra.yaml
+```bash
+cat <<'EOF' | oc apply -f -
 apiVersion: machineconfiguration.openshift.io/v1
 kind: MachineConfigPool
 metadata:
@@ -580,274 +826,234 @@ spec:
   nodeSelector:
     matchLabels:
       node-role.kubernetes.io/infra: ""
+EOF
 ```
 
-```bash
-oc apply -f mcp-infra.yaml
-```
-
-### 9.2 Aplicar label `infra` nos nodes
+### 10.2 Aplicar labels e taints
 
 ```bash
-oc label node infra-0.ocp.example.com node-role.kubernetes.io/infra=""
-oc label node infra-1.ocp.example.com node-role.kubernetes.io/infra=""
+# Aplicar label infra
+oc label node infra-0.ocp.SEU_IP_PUBLICO.sslip.io node-role.kubernetes.io/infra=""
+oc label node infra-1.ocp.SEU_IP_PUBLICO.sslip.io node-role.kubernetes.io/infra=""
 
-# Remover label worker (opcional, mas recomendado)
-oc label node infra-0.ocp.example.com node-role.kubernetes.io/worker-
-oc label node infra-1.ocp.example.com node-role.kubernetes.io/worker-
+# Remover label worker
+oc label node infra-0.ocp.SEU_IP_PUBLICO.sslip.io node-role.kubernetes.io/worker-
+oc label node infra-1.ocp.SEU_IP_PUBLICO.sslip.io node-role.kubernetes.io/worker-
+
+# Aplicar taint — impede pods sem toleração de ser agendados nos infra nodes
+oc adm taint nodes infra-0.ocp.SEU_IP_PUBLICO.sslip.io node-role.kubernetes.io/infra=:NoSchedule
+oc adm taint nodes infra-1.ocp.SEU_IP_PUBLICO.sslip.io node-role.kubernetes.io/infra=:NoSchedule
 
 # Verificar
 oc get nodes
-# infra-0 deve aparecer com ROLES: infra
+# infra-0 e infra-1 devem aparecer com ROLES: infra
 ```
 
-### 9.3 Aplicar Taint nos nodes infra
-
-O taint impede que pods sem toleração sejam agendados nos infra nodes:
+### 10.3 Aguardar o MachineConfigPool sincronizar
 
 ```bash
-oc adm taint nodes infra-0.ocp.example.com node-role.kubernetes.io/infra=:NoSchedule
-oc adm taint nodes infra-1.ocp.example.com node-role.kubernetes.io/infra=:NoSchedule
+oc get mcp
+# infra deve mostrar MACHINECOUNT: 2, READYMACHINECOUNT: 2
+# Aguarde — os nodes infra serão drenados e reiniciados para aplicar as configs
 ```
 
 ---
 
-## 10. Migração de Workloads de Infra
+## 11. Migração de Workloads de Infra
 
-### 10.1 Mover o Ingress Controller (Router)
-
-```bash
-oc edit ingresscontroller default -n openshift-ingress-operator
-```
-
-Adicione/edite o campo `spec`:
-
-```yaml
-spec:
-  replicas: 2
-  nodePlacement:
-    nodeSelector:
-      matchLabels:
-        node-role.kubernetes.io/infra: ""
-    tolerations:
-      - key: node-role.kubernetes.io/infra
-        effect: NoSchedule
-        operator: Exists
-```
+### 11.1 Mover o Ingress Controller (Router)
 
 ```bash
-# Verificar se os pods do router foram para os infra nodes
+oc patch ingresscontroller default \
+  -n openshift-ingress-operator \
+  --type=merge \
+  --patch='
+{
+  "spec": {
+    "replicas": 2,
+    "nodePlacement": {
+      "nodeSelector": {
+        "matchLabels": {
+          "node-role.kubernetes.io/infra": ""
+        }
+      },
+      "tolerations": [
+        {
+          "key": "node-role.kubernetes.io/infra",
+          "effect": "NoSchedule",
+          "operator": "Exists"
+        }
+      ]
+    }
+  }
+}'
+
+# Verificar
 oc get pods -n openshift-ingress -o wide
+# router-default-* devem estar nos infra nodes
 ```
 
-### 10.2 Mover o Image Registry
+### 11.2 Mover o Image Registry
 
 ```bash
-oc edit configs.imageregistry.operator.openshift.io cluster
-```
+oc patch configs.imageregistry.operator.openshift.io cluster \
+  --type=merge \
+  --patch='
+{
+  "spec": {
+    "managementState": "Managed",
+    "storage": {"emptyDir": {}},
+    "nodeSelector": {
+      "node-role.kubernetes.io/infra": ""
+    },
+    "tolerations": [
+      {
+        "key": "node-role.kubernetes.io/infra",
+        "effect": "NoSchedule",
+        "operator": "Exists"
+      }
+    ]
+  }
+}'
 
-Edite o campo `spec`:
-
-```yaml
-spec:
-  nodeSelector:
-    node-role.kubernetes.io/infra: ""
-  tolerations:
-    - key: node-role.kubernetes.io/infra
-      effect: NoSchedule
-      operator: Exists
-  storage:
-    emptyDir: {}       # para lab; em produção use PVC ou S3/NFS
-  managementState: Managed
-```
-
-```bash
 # Verificar
 oc get pods -n openshift-image-registry -o wide
 ```
 
-### 10.3 Mover o Monitoring Stack
+> `storage: emptyDir` é apenas para lab. Em produção use PVC (NFS, Ceph, etc.) ou S3.
+
+### 11.3 Mover o Monitoring Stack
 
 ```bash
-oc -n openshift-monitoring create configmap cluster-monitoring-config \
-  --from-literal=config.yaml='
-alertmanagerMain:
-  nodeSelector:
-    node-role.kubernetes.io/infra: ""
-  tolerations:
-    - key: node-role.kubernetes.io/infra
-      effect: NoSchedule
-      operator: Exists
-prometheusK8s:
-  nodeSelector:
-    node-role.kubernetes.io/infra: ""
-  tolerations:
-    - key: node-role.kubernetes.io/infra
-      effect: NoSchedule
-      operator: Exists
-prometheusOperator:
-  nodeSelector:
-    node-role.kubernetes.io/infra: ""
-  tolerations:
-    - key: node-role.kubernetes.io/infra
-      effect: NoSchedule
-      operator: Exists
-grafana:
-  nodeSelector:
-    node-role.kubernetes.io/infra: ""
-  tolerations:
-    - key: node-role.kubernetes.io/infra
-      effect: NoSchedule
-      operator: Exists
-k8sPrometheusAdapter:
-  nodeSelector:
-    node-role.kubernetes.io/infra: ""
-  tolerations:
-    - key: node-role.kubernetes.io/infra
-      effect: NoSchedule
-      operator: Exists
-kubeStateMetrics:
-  nodeSelector:
-    node-role.kubernetes.io/infra: ""
-  tolerations:
-    - key: node-role.kubernetes.io/infra
-      effect: NoSchedule
-      operator: Exists
-telemeterClient:
-  nodeSelector:
-    node-role.kubernetes.io/infra: ""
-  tolerations:
-    - key: node-role.kubernetes.io/infra
-      effect: NoSchedule
-      operator: Exists
-'
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    alertmanagerMain:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          effect: NoSchedule
+          operator: Exists
+    prometheusK8s:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          effect: NoSchedule
+          operator: Exists
+    prometheusOperator:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          effect: NoSchedule
+          operator: Exists
+    grafana:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          effect: NoSchedule
+          operator: Exists
+    k8sPrometheusAdapter:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          effect: NoSchedule
+          operator: Exists
+    kubeStateMetrics:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          effect: NoSchedule
+          operator: Exists
+    telemeterClient:
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          effect: NoSchedule
+          operator: Exists
+EOF
 
-# Aguardar pods recriar nos infra nodes
+# Acompanhar migração
 oc get pods -n openshift-monitoring -o wide -w
 ```
 
 ---
 
-## 11. Validação Final do Cluster
+## 12. Validação Final do Cluster
 
-### 11.1 Saúde geral do cluster
+### 12.1 Saúde geral
 
 ```bash
 export KUBECONFIG=~/ocp-install/auth/kubeconfig
 
-# Nodes
+# Todos os nodes devem estar Ready com os roles corretos
 oc get nodes -o wide
 
-# Espera-se:
-# master-0/1/2   Ready   master   ...
-# worker-0/1     Ready   worker   ...
-# infra-0/1      Ready   infra    ...
-
-# Operators
+# Todos os operators devem estar: AVAILABLE=True PROGRESSING=False DEGRADED=False
 oc get clusteroperators
-# Todos devem estar: AVAILABLE=True, PROGRESSING=False, DEGRADED=False
+
+# Ver eventos de erro (normal ter alguns no início, mas não devem persistir)
+oc get events --all-namespaces --sort-by='.lastTimestamp' | grep -v Normal | tail -20
 ```
 
-### 11.2 Validar etcd
+### 12.2 Validar etcd (3 membros saudáveis)
 
 ```bash
-# Entrar em um pod etcd
-oc rsh -n openshift-etcd $(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)
-
-# Dentro do pod:
-etcdctl endpoint health \
-  --endpoints=https://master-0.ocp.example.com:2379,https://master-1.ocp.example.com:2379,https://master-2.ocp.example.com:2379 \
-  --cacert=/etc/kubernetes/static-pod-resources/etcd-certs/configmaps/etcd-serving-ca/ca-bundle.crt \
-  --cert=/etc/kubernetes/static-pod-resources/etcd-certs/secrets/etcd-all-certs/etcd-peer-master-0.ocp.example.com.crt \
-  --key=/etc/kubernetes/static-pod-resources/etcd-certs/secrets/etcd-all-certs/etcd-peer-master-0.ocp.example.com.key
+oc rsh -n openshift-etcd \
+  $(oc get pods -n openshift-etcd -l app=etcd -o name | head -1) \
+  etcdctl endpoint status --cluster -w table
 ```
 
-### 11.3 Validar Ingress
+### 12.3 Validar acesso externo às rotas
 
 ```bash
 # Criar app de teste
-oc new-project test-ingress
-oc new-app --image=nginx --name=nginx-test -n test-ingress
-oc expose service nginx-test -n test-ingress
+oc new-project test-app
+oc new-app --image=registry.access.redhat.com/ubi9/nginx-120 --name=nginx-test -n test-app
+oc expose service nginx-test -n test-app
 
-# Verificar route
-oc get route nginx-test -n test-ingress
+# Ver a route gerada
+oc get route nginx-test -n test-app
+# Deve mostrar: nginx-test-test-app.apps.ocp.SEU_IP_PUBLICO.sslip.io
 
-# Testar acesso
-curl -I http://nginx-test-test-ingress.apps.ocp.example.com
+# Testar do seu computador (fora do Proxmox)
+curl -I http://nginx-test-test-app.apps.ocp.SEU_IP_PUBLICO.sslip.io
+# Esperado: HTTP/1.1 200 OK
 
 # Limpar
-oc delete project test-ingress
+oc delete project test-app
 ```
 
-### 11.4 Verificar distribuição de pods nos infra nodes
+### 12.4 Verificar distribuição dos componentes de infra
 
 ```bash
-# Router
-oc get pods -n openshift-ingress -o wide | grep -E "NODE|infra"
-
-# Registry
-oc get pods -n openshift-image-registry -o wide | grep -E "NODE|infra"
-
-# Monitoring
-oc get pods -n openshift-monitoring -o wide | grep -E "NODE|infra"
+echo "=== Router ===" && oc get pods -n openshift-ingress -o wide
+echo "=== Registry ===" && oc get pods -n openshift-image-registry -o wide
+echo "=== Monitoring ===" && oc get pods -n openshift-monitoring -o wide | grep -v "Completed"
 ```
 
-### 11.5 Checklist final
-
-```
-[ ] Todos os 7 nodes em Ready
-[ ] Todos os ClusterOperators Available=True, Degraded=False
-[ ] etcd com 3 membros healthy
-[ ] Router rodando nos infra nodes
-[ ] Registry rodando nos infra nodes
-[ ] Monitoring rodando nos infra nodes
-[ ] Workers sem pods de infra
-[ ] Console web acessível em https://console-openshift-console.apps.ocp.example.com
-[ ] Login com kubeadmin funcional
-[ ] Trocar senha do kubeadmin (configurar identity provider)
-```
-
----
-
-## 12. Comandos de Referência Rápida
+### 12.5 Configurar Identity Provider (substituir kubeadmin)
 
 ```bash
-# Exportar kubeconfig
-export KUBECONFIG=~/ocp-install/auth/kubeconfig
-
-# Obter credenciais do kubeadmin
-cat ~/ocp-install/auth/kubeadmin-password
-
-# Ver todos os nodes com roles
-oc get nodes -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type,ROLES:.metadata.labels
-
-# Ver eventos recentes com problemas
-oc get events --all-namespaces --sort-by='.lastTimestamp' | grep -v Normal | tail -30
-
-# Ver logs de um operator
-oc logs -n openshift-ingress-operator deploy/ingress-operator -f
-
-# Escalar réplicas do router
-oc patch ingresscontroller default -n openshift-ingress-operator \
-  --type=merge -p '{"spec":{"replicas":2}}'
-
-# Verificar MachineConfigPools
-oc get mcp
-
-# Ver MachineConfigs aplicados a um node
-oc get node infra-0.ocp.example.com -o yaml | grep currentConfig
-
-# Debug de node
-oc debug node/infra-0.ocp.example.com
-
-# Configurar HTPasswd como identity provider (substituir kubeadmin)
-htpasswd -c -B -b /tmp/htpasswd admin MinhaS3nhaF0rte
+# Criar usuário admin com HTPasswd
+htpasswd -c -B -b /tmp/htpasswd admin SuaSenhaForte123!
 oc create secret generic htpass-secret \
   --from-file=htpasswd=/tmp/htpasswd \
   -n openshift-config
 
-oc apply -f - <<EOF
+# Configurar OAuth
+cat <<'EOF' | oc apply -f -
 apiVersion: config.openshift.io/v1
 kind: OAuth
 metadata:
@@ -862,27 +1068,93 @@ spec:
           name: htpass-secret
 EOF
 
-# Dar role cluster-admin ao novo usuário
+# Dar cluster-admin ao usuário criado
 oc adm policy add-cluster-role-to-user cluster-admin admin
+
+# Testar login
+oc login -u admin -p SuaSenhaForte123! \
+  https://api.ocp.SEU_IP_PUBLICO.sslip.io:6443
+
+# Após confirmar que admin funciona, remover kubeadmin (opcional)
+oc delete secret kubeadmin -n kube-system
+```
+
+### 12.6 Checklist final
+
+```
+[ ] 7 nodes em Ready (3 master, 2 worker, 2 infra)
+[ ] Todos ClusterOperators: AVAILABLE=True, PROGRESSING=False, DEGRADED=False
+[ ] etcd: 3 membros healthy
+[ ] dnsmasq respondendo na 192.168.100.1
+[ ] HAProxy: api:6443, ingress:80/443 operacionais
+[ ] Router rodando nos infra nodes
+[ ] Registry rodando nos infra nodes
+[ ] Monitoring rodando nos infra nodes
+[ ] Route de teste acessível externamente via sslip.io
+[ ] Console acessível: https://console-openshift-console.apps.ocp.SEU_IP_PUBLICO.sslip.io
+[ ] Login com HTPasswd funcionando
+[ ] kubeadmin removido (opcional)
+```
+
+---
+
+## 13. Comandos de Referência Rápida
+
+```bash
+# Exportar kubeconfig
+export KUBECONFIG=~/ocp-install/auth/kubeconfig
+
+# Senha do kubeadmin (durante instalação)
+cat ~/ocp-install/auth/kubeadmin-password
+
+# Nodes com roles
+oc get nodes
+
+# Status dos MachineConfigPools
+oc get mcp
+
+# Operators com problema
+oc get co | grep -v "True.*False.*False"
+
+# Eventos de erro
+oc get events -A --sort-by='.lastTimestamp' | grep -i "error\|fail\|warning" | tail -20
+
+# Debug de um node
+oc debug node/infra-0.ocp.SEU_IP_PUBLICO.sslip.io
+
+# Logs de um operator
+oc logs -n openshift-ingress-operator deploy/ingress-operator --tail=50 -f
+
+# Ver config atual do MCS aplicado a um node
+oc get node master-0.ocp.SEU_IP_PUBLICO.sslip.io \
+  -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig}'
+
+# Inspecionar logs do dnsmasq no bastion
+sudo tail -f /var/log/dnsmasq.log
+
+# Verificar HAProxy stats
+echo "show stat" | sudo socat stdio /var/lib/haproxy/stats 2>/dev/null || \
+  sudo haproxy -c -f /etc/haproxy/haproxy.cfg
 ```
 
 ---
 
 ## Notas de Estudo
 
-| Conceito               | O que estudar                                              |
-|------------------------|------------------------------------------------------------|
-| **etcd**               | Quorum, backup, restore, defragment                        |
-| **MachineConfig**      | Como funciona o MCO, pools, rendered configs               |
-| **Ingress**            | Tipos de route (edge/passthrough/reencrypt), certificados  |
-| **SDN (OVN)**          | NetworkPolicy, EgressIP, MultusNetworks                    |
-| **RBAC**               | ClusterRole, Role, ServiceAccount                          |
-| **SCC**                | Security Context Constraints — diferença do K8s padrão     |
-| **Operators**          | CVO, OLM, criar seu próprio operator                       |
-| **Persistent Storage** | StorageClass, PVC, PV, CSI drivers                         |
-| **Identity Providers** | LDAP, HTPasswd, OIDC                                       |
-| **Updates**            | Channel, graph, oc adm upgrade                             |
+| Conceito               | O que estudar                                               |
+|------------------------|-------------------------------------------------------------|
+| **etcd**               | Quorum, backup (`etcdctl snapshot save`), restore, defrag  |
+| **MachineConfig**      | MCO, pools, rendered configs, como aplicar mudanças        |
+| **Ingress**            | Route types: edge / passthrough / reencrypt, certificados  |
+| **SDN (OVN)**          | NetworkPolicy, EgressIP, Multus                            |
+| **RBAC**               | ClusterRole, Role, ServiceAccount, RoleBinding             |
+| **SCC**                | Security Context Constraints vs. PodSecurityPolicy K8s     |
+| **Operators**          | CVO (cluster), OLM (apps), criar operator com SDK          |
+| **Storage**            | StorageClass, PVC, PV, CSI drivers, LocalVolume            |
+| **Identity Providers** | LDAP, HTPasswd, OIDC (Keycloak, etc.)                      |
+| **Updates**            | `oc adm upgrade`, canais, graph, EUS                       |
 
 ---
 
-*Guia criado para estudo e laboratório. Não utilizar diretamente em produção sem revisão das especificações do ambiente.*
+*Guia criado para estudo e laboratório em ambiente Proxmox.*  
+*Substitua `SEU_IP_PUBLICO` pelo IP público real antes de iniciar.*
