@@ -42,7 +42,7 @@
 │  ┌──────┴──────────────────────────────┴──────┐               │
 │  │  BASTION VM                                 │               │
 │  │  eth0: SEU_IP_PUBLICO (ou NAT)             │               │
-│  │  eth1: 192.168.100.1 (gateway + DNS + LB)  │               │
+│  │  eth1: 192.168.100.110 (gateway + DNS + LB) │               │
 │  └─────────────────────────────────────────────┘               │
 │                        │ vmbr1                                  │
 │          ┌─────────────┼─────────────┐                         │
@@ -67,27 +67,27 @@ necessidade de registrar um domínio ou configurar DNS externo para as rotas de 
 
 ### 1.2 Topologia de Nodes
 
-| Role    | Qtd | IP interno      | Hostname base              |
-|---------|-----|-----------------|----------------------------|
-| bastion | 1   | 192.168.100.1   | bastion (gateway + DNS + LB)|
-| bootstrap| 1  | 192.168.100.10  | bootstrap                  |
-| master  | 3   | .11 / .12 / .13 | master-0 / 1 / 2           |
-| worker  | 2   | .21 / .22       | worker-0 / 1               |
-| infra   | 2   | .31 / .32       | infra-0 / 1                |
+| Role    | Qtd | IP interno        | Hostname base              |
+|---------|-----|-------------------|----------------------------|
+| bastion | 1   | 192.168.100.110   | bastion (gateway + DNS + LB)|
+| bootstrap| 1  | 192.168.100.111   | bootstrap                  |
+| master  | 3   | .112 / .113 / .114| master-0 / 1 / 2           |
+| worker  | 2   | .115 / .116       | worker-0 / 1               |
+| infra   | 2   | .117 / .118       | infra-0 / 1                |
 
 > Os nodes RHCOS **não têm acesso direto à internet** — usam o bastion como gateway NAT.
 
 ### 1.3 Portas que o bastion precisa escutar
 
-| Porta  | IP               | Direção     | Função                          |
-|--------|------------------|-------------|---------------------------------|
-| 53     | 192.168.100.1    | interna     | dnsmasq — DNS dos nodes         |
-| 80     | SEU_IP_PUBLICO   | externa     | Ingress HTTP                    |
-| 443    | SEU_IP_PUBLICO   | externa     | Ingress HTTPS                   |
-| 6443   | SEU_IP_PUBLICO   | externa     | API (acesso externo / oc CLI)   |
-| 6443   | 192.168.100.1    | interna     | API (acesso dos nodes)          |
-| 22623  | 192.168.100.1    | interna     | Machine Config Server           |
-| 80     | 192.168.100.1    | interna     | Servidor HTTP — ignition files  |
+| Porta  | IP                 | Direção     | Função                          |
+|--------|--------------------|-------------|---------------------------------|
+| 53     | 192.168.100.110    | interna     | dnsmasq — DNS dos nodes         |
+| 80     | SEU_IP_PUBLICO     | externa     | Ingress HTTP                    |
+| 443    | SEU_IP_PUBLICO     | externa     | Ingress HTTPS                   |
+| 6443   | SEU_IP_PUBLICO     | externa     | API (acesso externo / oc CLI)   |
+| 6443   | 192.168.100.110    | interna     | API (acesso dos nodes)          |
+| 22623  | 192.168.100.110    | interna     | Machine Config Server           |
+| 80     | 192.168.100.110    | interna     | Servidor HTTP — ignition files  |
 
 ---
 
@@ -101,7 +101,7 @@ No host Proxmox, edite `/etc/network/interfaces` e adicione:
 # Bridge interna para o cluster OCP — sem gateway, sem acesso externo direto
 auto vmbr1
 iface vmbr1 inet static
-    address 192.168.100.1/24
+    address 192.168.100.110/24
     bridge-ports none
     bridge-stp off
     bridge-fd 0
@@ -121,15 +121,13 @@ Verifique:
 
 ```bash
 ip addr show vmbr1
-# deve mostrar 192.168.100.1/24
+# deve mostrar 192.168.100.110/24
 ```
 
 > `vmbr0` continua sendo a bridge de management/internet do Proxmox host (existente).  
-> O IP `192.168.100.1` no `vmbr1` é do **host Proxmox**, mas o bastion VM vai ter  
-> esse mesmo IP como interface interna — configure apenas um dos dois, ou use `.1` no  
-> bastion e outro IP no host se precisar.  
-> **Recomendação:** deixe o IP `192.168.100.1/24` no `vmbr1` do bastion VM;  
-> no host Proxmox, não atribua IP à vmbr1 (deixe só como bridge).
+> O IP `192.168.100.110` no `vmbr1` é do **bastion VM** — não atribua IP à vmbr1 no  
+> host Proxmox (deixe só como bridge).  
+> **Recomendação:** deixe o `vmbr1` do host sem IP; apenas o bastion VM terá `.110`.
 
 ### 2.2 Bridge corrigida para o host (sem IP no host)
 
@@ -141,7 +139,7 @@ iface vmbr1 inet manual
     bridge-fd 0
 ```
 
-Assim, apenas o bastion VM terá o IP `192.168.100.1` nessa rede.
+Assim, apenas o bastion VM terá o IP `192.168.100.110` nessa rede.
 
 ---
 
@@ -260,12 +258,12 @@ consigam acessar a internet — necessário para pull de imagens de container.
 
 Instale o SO no bastion via ISO. Configure:
 - **eth0** (vmbr0): IP obtido por DHCP ou IP do seu ambiente de management
-- **eth1** (vmbr1): IP estático `192.168.100.1/24` — gateway da rede interna
+- **eth1** (vmbr1): IP estático `192.168.100.110/24` — gateway da rede interna
 
 ```bash
 # Configurar eth1 com IP estático no bastion
 sudo nmcli con add type ethernet con-name eth1-internal ifname eth1 \
-  ip4 192.168.100.1/24
+  ip4 192.168.100.110/24
 
 sudo nmcli con up eth1-internal
 ```
@@ -303,7 +301,7 @@ curl -s https://registry.redhat.io -o /dev/null -w "%{http_code}\n"
 ## 5. Configuração de DNS com dnsmasq
 
 O `dnsmasq` resolve **todos** os nomes do cluster internamente.  
-Os nodes RHCOS são configurados para usar `192.168.100.1` (bastion) como DNS.
+Os nodes RHCOS são configurados para usar `192.168.100.110` (bastion) como DNS.
 
 ### 5.1 Instalar dnsmasq
 
@@ -337,38 +335,38 @@ domain=ocp.SEU_IP_PUBLICO.sslip.io
 # ──────────────────────────────────────────────────
 # API — resolve para o bastion (HAProxy interno)
 # ──────────────────────────────────────────────────
-address=/api.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.1
-address=/api-int.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.1
+address=/api.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.110
+address=/api-int.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.110
 
 # ──────────────────────────────────────────────────
 # Apps wildcard — resolve internamente para o bastion
 # (HAProxy redireciona para infra nodes na porta 80/443)
 # ──────────────────────────────────────────────────
-address=/.apps.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.1
+address=/.apps.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.110
 
 # ──────────────────────────────────────────────────
 # Nodes individuais
 # ──────────────────────────────────────────────────
-address=/bootstrap.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.10
-address=/master-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.11
-address=/master-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.12
-address=/master-2.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.13
-address=/worker-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.21
-address=/worker-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.22
-address=/infra-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.31
-address=/infra-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.32
+address=/bootstrap.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.111
+address=/master-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.112
+address=/master-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.113
+address=/master-2.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.114
+address=/worker-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.115
+address=/worker-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.116
+address=/infra-0.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.117
+address=/infra-1.ocp.SEU_IP_PUBLICO.sslip.io/192.168.100.118
 
 # ──────────────────────────────────────────────────
 # Registros PTR (reverse DNS) — obrigatório para OCP
 # ──────────────────────────────────────────────────
-ptr-record=10.100.168.192.in-addr.arpa,bootstrap.ocp.SEU_IP_PUBLICO.sslip.io
-ptr-record=11.100.168.192.in-addr.arpa,master-0.ocp.SEU_IP_PUBLICO.sslip.io
-ptr-record=12.100.168.192.in-addr.arpa,master-1.ocp.SEU_IP_PUBLICO.sslip.io
-ptr-record=13.100.168.192.in-addr.arpa,master-2.ocp.SEU_IP_PUBLICO.sslip.io
-ptr-record=21.100.168.192.in-addr.arpa,worker-0.ocp.SEU_IP_PUBLICO.sslip.io
-ptr-record=22.100.168.192.in-addr.arpa,worker-1.ocp.SEU_IP_PUBLICO.sslip.io
-ptr-record=31.100.168.192.in-addr.arpa,infra-0.ocp.SEU_IP_PUBLICO.sslip.io
-ptr-record=32.100.168.192.in-addr.arpa,infra-1.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=111.100.168.192.in-addr.arpa,bootstrap.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=112.100.168.192.in-addr.arpa,master-0.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=113.100.168.192.in-addr.arpa,master-1.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=114.100.168.192.in-addr.arpa,master-2.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=115.100.168.192.in-addr.arpa,worker-0.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=116.100.168.192.in-addr.arpa,worker-1.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=117.100.168.192.in-addr.arpa,infra-0.ocp.SEU_IP_PUBLICO.sslip.io
+ptr-record=118.100.168.192.in-addr.arpa,infra-1.ocp.SEU_IP_PUBLICO.sslip.io
 
 # Log de queries (útil para debug — comente em produção)
 log-queries
@@ -395,24 +393,24 @@ sudo systemctl status dnsmasq
 sudo dnf install -y bind-utils
 
 # Forward
-dig @192.168.100.1 api.ocp.SEU_IP_PUBLICO.sslip.io +short
-# deve retornar: 192.168.100.1
+dig @192.168.100.110 api.ocp.SEU_IP_PUBLICO.sslip.io +short
+# deve retornar: 192.168.100.110
 
-dig @192.168.100.1 api-int.ocp.SEU_IP_PUBLICO.sslip.io +short
-# deve retornar: 192.168.100.1
+dig @192.168.100.110 api-int.ocp.SEU_IP_PUBLICO.sslip.io +short
+# deve retornar: 192.168.100.110
 
-dig @192.168.100.1 console-openshift-console.apps.ocp.SEU_IP_PUBLICO.sslip.io +short
-# deve retornar: 192.168.100.1
+dig @192.168.100.110 console-openshift-console.apps.ocp.SEU_IP_PUBLICO.sslip.io +short
+# deve retornar: 192.168.100.110
 
-dig @192.168.100.1 master-0.ocp.SEU_IP_PUBLICO.sslip.io +short
-# deve retornar: 192.168.100.11
+dig @192.168.100.110 master-0.ocp.SEU_IP_PUBLICO.sslip.io +short
+# deve retornar: 192.168.100.112
 
 # Reverse
-dig @192.168.100.1 -x 192.168.100.11 +short
+dig @192.168.100.110 -x 192.168.100.112 +short
 # deve retornar: master-0.ocp.SEU_IP_PUBLICO.sslip.io.
 
 # Upstream (internet) — confirma que o forward para 8.8.8.8 funciona
-dig @192.168.100.1 registry.redhat.io +short
+dig @192.168.100.110 registry.redhat.io +short
 ```
 
 ---
@@ -420,7 +418,7 @@ dig @192.168.100.1 registry.redhat.io +short
 ## 6. Configuração do Load Balancer (HAProxy)
 
 O HAProxy roda no bastion e serve dois propósitos:
-- **Rede interna (192.168.100.1):** API + MCS para os nodes do cluster
+- **Rede interna (192.168.100.110):** API + MCS para os nodes do cluster
 - **IP público (SEU_IP_PUBLICO):** Ingress HTTP/HTTPS + API para acesso externo
 
 ```bash
@@ -453,26 +451,26 @@ frontend api_frontend
 backend api_backend
     balance roundrobin
     option tcp-check
-    server bootstrap  192.168.100.10:6443  check
-    server master-0   192.168.100.11:6443  check
-    server master-1   192.168.100.12:6443  check
-    server master-2   192.168.100.13:6443  check
+    server bootstrap  192.168.100.111:6443  check
+    server master-0   192.168.100.112:6443  check
+    server master-1   192.168.100.113:6443  check
+    server master-2   192.168.100.114:6443  check
 
 #---------------------------------------------------------------------
 # Machine Config Server — porta 22623
 # Apenas rede interna (nodes precisam baixar config durante boot)
 #---------------------------------------------------------------------
 frontend mcs_frontend
-    bind 192.168.100.1:22623
+    bind 192.168.100.110:22623
     default_backend mcs_backend
 
 backend mcs_backend
     balance roundrobin
     option tcp-check
-    server bootstrap  192.168.100.10:22623 check
-    server master-0   192.168.100.11:22623 check
-    server master-1   192.168.100.12:22623 check
-    server master-2   192.168.100.13:22623 check
+    server bootstrap  192.168.100.111:22623 check
+    server master-0   192.168.100.112:22623 check
+    server master-1   192.168.100.113:22623 check
+    server master-2   192.168.100.114:22623 check
 
 #---------------------------------------------------------------------
 # Ingress HTTP — porta 80
@@ -485,8 +483,8 @@ frontend ingress_http_frontend
 backend ingress_http_backend
     balance roundrobin
     option tcp-check
-    server infra-0  192.168.100.31:80  check
-    server infra-1  192.168.100.32:80  check
+    server infra-0  192.168.100.117:80  check
+    server infra-1  192.168.100.118:80  check
 
 #---------------------------------------------------------------------
 # Ingress HTTPS — porta 443
@@ -499,8 +497,8 @@ frontend ingress_https_frontend
 backend ingress_https_backend
     balance roundrobin
     option tcp-check
-    server infra-0  192.168.100.31:443 check
-    server infra-1  192.168.100.32:443 check
+    server infra-0  192.168.100.117:443 check
+    server infra-1  192.168.100.118:443 check
 ```
 
 ```bash
@@ -646,7 +644,7 @@ sudo chmod 644 /var/www/html/*.ign
 sudo restorecon -Rv /var/www/html/
 
 # Testar
-curl http://192.168.100.1/bootstrap.ign | python3 -m json.tool | head -5
+curl http://192.168.100.110/bootstrap.ign | python3 -m json.tool | head -5
 ```
 
 ---
@@ -660,9 +658,9 @@ na linha `linux` (após `quiet`):
 
 ```
 coreos.inst.install_dev=/dev/sda
-coreos.inst.ignition_url=http://192.168.100.1/<arquivo>.ign
-ip=<IP_NODE>::192.168.100.1:255.255.255.0:<HOSTNAME>:<INTERFACE>:none
-nameserver=192.168.100.1
+coreos.inst.ignition_url=http://192.168.100.110/<arquivo>.ign
+ip=<IP_NODE>::192.168.100.110:255.255.255.0:<HOSTNAME>:<INTERFACE>:none
+nameserver=192.168.100.110
 ```
 
 > `<INTERFACE>`: geralmente `ens3` ou `enp6s18` em VMs Proxmox com virtio.  
@@ -687,51 +685,51 @@ Passo 8: infra-1     (worker.ign)
 **Bootstrap:**
 ```
 coreos.inst.install_dev=/dev/sda
-coreos.inst.ignition_url=http://192.168.100.1/bootstrap.ign
-ip=192.168.100.10::192.168.100.1:255.255.255.0:bootstrap.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
-nameserver=192.168.100.1
+coreos.inst.ignition_url=http://192.168.100.110/bootstrap.ign
+ip=192.168.100.111::192.168.100.110:255.255.255.0:bootstrap.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+nameserver=192.168.100.110
 ```
 
 **master-0:**
 ```
 coreos.inst.install_dev=/dev/sda
-coreos.inst.ignition_url=http://192.168.100.1/master.ign
-ip=192.168.100.11::192.168.100.1:255.255.255.0:master-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
-nameserver=192.168.100.1
+coreos.inst.ignition_url=http://192.168.100.110/master.ign
+ip=192.168.100.112::192.168.100.110:255.255.255.0:master-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+nameserver=192.168.100.110
 ```
 
 **master-1:**
 ```
-ip=192.168.100.12::192.168.100.1:255.255.255.0:master-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+ip=192.168.100.113::192.168.100.110:255.255.255.0:master-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
 ```
 
 **master-2:**
 ```
-ip=192.168.100.13::192.168.100.1:255.255.255.0:master-2.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+ip=192.168.100.114::192.168.100.110:255.255.255.0:master-2.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
 ```
 
 **worker-0:**
 ```
-coreos.inst.ignition_url=http://192.168.100.1/worker.ign
-ip=192.168.100.21::192.168.100.1:255.255.255.0:worker-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
-nameserver=192.168.100.1
+coreos.inst.ignition_url=http://192.168.100.110/worker.ign
+ip=192.168.100.115::192.168.100.110:255.255.255.0:worker-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+nameserver=192.168.100.110
 ```
 
 **worker-1:**
 ```
-ip=192.168.100.22::192.168.100.1:255.255.255.0:worker-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+ip=192.168.100.116::192.168.100.110:255.255.255.0:worker-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
 ```
 
 **infra-0** (usa worker.ign):
 ```
-coreos.inst.ignition_url=http://192.168.100.1/worker.ign
-ip=192.168.100.31::192.168.100.1:255.255.255.0:infra-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
-nameserver=192.168.100.1
+coreos.inst.ignition_url=http://192.168.100.110/worker.ign
+ip=192.168.100.117::192.168.100.110:255.255.255.0:infra-0.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+nameserver=192.168.100.110
 ```
 
 **infra-1:**
 ```
-ip=192.168.100.32::192.168.100.1:255.255.255.0:infra-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
+ip=192.168.100.118::192.168.100.110:255.255.255.0:infra-1.ocp.SEU_IP_PUBLICO.sslip.io:ens3:none
 ```
 
 ### 9.4 Monitorar o bootstrap
@@ -744,7 +742,7 @@ openshift-install wait-for bootstrap-complete \
   --log-level=info
 
 # Se travar, inspecione diretamente:
-ssh -i ~/.ssh/ocp_id_ed25519 core@192.168.100.10 \
+ssh -i ~/.ssh/ocp_id_ed25519 core@192.168.100.111 \
   "journalctl -b -f -u release-image.service -u bootkube.service"
 ```
 
@@ -791,8 +789,8 @@ Após `install-complete`:
 ```bash
 sudo vi /etc/haproxy/haproxy.cfg
 # Comente ou remova as linhas do bootstrap nos backends api e mcs:
-#   server bootstrap  192.168.100.10:6443  check
-#   server bootstrap  192.168.100.10:22623 check
+#   server bootstrap  192.168.100.111:6443  check
+#   server bootstrap  192.168.100.111:22623 check
 
 sudo systemctl reload haproxy
 
@@ -1085,7 +1083,7 @@ oc delete secret kubeadmin -n kube-system
 [ ] 7 nodes em Ready (3 master, 2 worker, 2 infra)
 [ ] Todos ClusterOperators: AVAILABLE=True, PROGRESSING=False, DEGRADED=False
 [ ] etcd: 3 membros healthy
-[ ] dnsmasq respondendo na 192.168.100.1
+[ ] dnsmasq respondendo na 192.168.100.110
 [ ] HAProxy: api:6443, ingress:80/443 operacionais
 [ ] Router rodando nos infra nodes
 [ ] Registry rodando nos infra nodes
@@ -1156,5 +1154,257 @@ echo "show stat" | sudo socat stdio /var/lib/haproxy/stats 2>/dev/null || \
 
 ---
 
+## 14. Troubleshooting — Problemas Encontrados e Correções
+
+Esta seção documenta todos os problemas encontrados durante a instalação real do cluster
+(realizada em 2026-04-13/14) e as correções aplicadas para que o cluster ficasse 100% funcional.
+
+### 14.1 Terraform — Erros na criação das VMs
+
+**Problema 1: `hostname lookup 'SEU_NODE' failed`**
+O campo `node` no `ocp-lab.tfvars` estava com o placeholder `SEU_NODE`.
+```bash
+# Correção: substituir pelo nome real do node Proxmox
+sed -i 's/node.*=.*"SEU_NODE"/node   = "suhr"/' terraform/clusters/ocp-lab.tfvars
+```
+
+**Problema 2: `storage 'local' is disabled`**
+O storage `local` estava desabilitado no Proxmox. A ISO RHCOS foi movida para outro storage.
+```bash
+# Correção no ocp-lab.tfvars:
+rhcos_iso = "vz-folder:iso/rhcos-4.16.51-x86_64-live.x86_64.iso"
+```
+
+**Problema 3: `volume does not exist` na ISO**
+O nome do arquivo ISO no tfvars estava errado (`rhcos-4.16.1` vs o real `rhcos-4.16.51`).
+Corrigido com o nome exato da ISO que foi feita upload no Proxmox.
+
+### 14.2 Rede do Bastion — Interface e NAT
+
+**Problema: NAT não funciona — interface errada**
+O Debian 13 no bastion nomeou as interfaces como `eth0`/`eth1` (não `ens18`/`ens19`).
+A regra de NAT usava `ens19` mas a interface pública era `eth1`.
+
+```bash
+# Verificar nomes reais
+ip link show
+
+# Correção: limpar e recriar NAT com a interface correta
+iptables -t nat -F
+iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Persistir
+echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+sysctl -p
+```
+
+### 14.3 RHCOS — Interface de rede nos nodes
+
+**Problema: interface `ens18` (não `eth0`)**
+As VMs RHCOS no Proxmox usam `ens18` como nome da interface de rede (virtio).
+Kernel args com `eth0` não funcionam. A solução mais simples foi usar **DHCP via dnsmasq**
+em vez de IPs estáticos nos kernel args.
+
+### 14.4 DHCP — IPs não seguiram o plano
+
+**Problema: nodes pegaram IPs diferentes do planejado**
+Sem reservas DHCP prévias no dnsmasq, os nodes pegaram IPs na ordem em que bootaram,
+não na ordem planejada (.112/.113/.114 para masters, etc.).
+
+**Solução: adicionar reservas DHCP baseadas nos MACs reais das VMs**
+
+Para descobrir os MACs e IPs atuais:
+```bash
+cat /var/lib/misc/dnsmasq.leases
+```
+
+Adicionar reservas no `/etc/dnsmasq.conf` com os IPs **reais** (não os planejados):
+```
+dhcp-host=BC:24:11:AE:E0:5D,bootstrap,192.168.100.111
+dhcp-host=BC:24:11:E3:D4:29,master-0,192.168.100.116
+dhcp-host=BC:24:11:3E:BC:81,master-1,192.168.100.113
+dhcp-host=BC:24:11:C9:8F:6F,master-2,192.168.100.115
+dhcp-host=BC:24:11:34:07:CE,infra-0,192.168.100.112
+dhcp-host=BC:24:11:5B:E7:DB,worker-0,192.168.100.117
+dhcp-host=BC:24:11:51:BE:15,infra-1,192.168.100.118
+dhcp-host=BC:24:11:3A:E4:B4,worker-1,192.168.100.119
+```
+
+> **Importante:** não criar reservas duplicadas para o mesmo IP — causa `dnsmasq` parar.
+
+```bash
+systemctl restart dnsmasq
+```
+
+### 14.5 HAProxy — Backends com IPs errados
+
+**Problema:** O HAProxy foi configurado com IPs planejados, mas os masters pegaram IPs diferentes.
+
+```bash
+# Correção: atualizar /etc/haproxy/haproxy.cfg com IPs reais dos masters
+# API backend (6443):
+#   master-0 → 192.168.100.116
+#   master-1 → 192.168.100.113
+#   master-2 → 192.168.100.115
+
+# Ingress backend (80/443):
+#   infra-0 → 192.168.100.112
+#   infra-1 → 192.168.100.118
+
+systemctl reload haproxy
+```
+
+### 14.6 DNS — Wildcard `.apps` apontando para IP errado
+
+**Problema:** O dnsmasq tinha `address=/.apps.ocp.177.54.151.49.sslip.io/192.168.100.117`
+mas .117 era worker-0, não um infra node. O tráfego de ingress deve passar pelo HAProxy no bastion.
+
+```bash
+# Correção: apontar .apps para o bastion (que repassa via HAProxy para os infra nodes)
+sed -i 's|address=/.apps.ocp.177.54.151.49.sslip.io/.*|address=/.apps.ocp.177.54.151.49.sslip.io/192.168.100.110|' /etc/dnsmasq.conf
+systemctl restart dnsmasq
+```
+
+### 14.7 Hostnames — Nodes com `localhost.localdomain`
+
+**Problema:** Os RHCOS nodes bootaram sem hostname correto. Sem definir hostname nos
+kernel args, todos ficaram como `localhost.localdomain`, causando conflitos no cluster.
+
+**Solução:** SSH em cada node e definir hostname manualmente:
+```bash
+ssh core@<IP_DO_NODE>
+sudo hostnamectl set-hostname <nome-correto>
+# Ex: master-0, master-1, worker-0, infra-0, etc.
+```
+
+Para nodes que já entraram no cluster com FQDN (ex: `worker-0.ocp.177.54.151.49.sslip.io`),
+foi necessário drenar, renomear e re-registrar:
+```bash
+oc adm drain <nome-antigo> --ignore-daemonsets --delete-emptydir-data
+ssh core@<IP> "sudo hostnamectl set-hostname <nome-curto>"
+ssh core@<IP> "sudo systemctl restart kubelet"
+oc delete node <nome-antigo>
+# Aprovar novo CSR:
+oc get csr -o name | xargs oc adm certificate approve
+```
+
+### 14.8 CSR — Aprovação em múltiplas rodadas
+
+**Problema:** Cada node que entra no cluster gera CSRs que precisam ser aprovados.
+Após renames de hostname, novos CSRs são gerados. Execute várias vezes:
+
+```bash
+oc get csr | grep Pending
+oc get csr -o name | xargs oc adm certificate approve
+```
+
+> **Nota:** CSRs de Multus negados (ex: `expected system:multus:localhost.localdomain
+> but got system:multus:master-2`) são normais após rename e não precisam de intervenção.
+
+### 14.9 Infra Nodes — Ingress Router nos masters
+
+**Problema:** Após criar os infra nodes, o Ingress Router continuou rodando nos masters.
+
+```bash
+# Correção: mover o IngressController para os infra nodes
+oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge -p '{
+  "spec": {
+    "nodePlacement": {
+      "nodeSelector": {
+        "matchLabels": {
+          "node-role.kubernetes.io/infra": ""
+        }
+      },
+      "tolerations": [
+        {
+          "key": "node-role.kubernetes.io/infra",
+          "effect": "NoSchedule",
+          "operator": "Exists"
+        }
+      ]
+    },
+    "replicas": 2
+  }
+}'
+
+# Verificar migração
+oc get pods -n openshift-ingress -o wide
+```
+
+### 14.10 MCD CrashLoop — rpm-ostree "Old and new refs are equal"
+
+**Problema:** O Machine Config Daemon ficava em CrashLoopBackOff nos workers/infra.
+O erro era `rpm-ostree rebase: Old and new refs are equal` — a atualização de OS já estava
+staged mas não ativada, e o MCD tentava estagiar novamente.
+
+**Solução:** Drenar e reiniciar cada node afetado para ativar o deploy staged:
+```bash
+oc adm drain <node> --ignore-daemonsets --delete-emptydir-data
+ssh core@<IP> "sudo reboot"
+oc wait node/<node> --for=condition=Ready --timeout=5m
+oc adm uncordon <node>
+```
+
+### 14.11 MCD — Annotation `desiredConfig` ausente após rename
+
+**Problema:** Após renomear um node, a annotation `machineconfiguration.openshift.io/desiredConfig`
+pode desaparecer, causando crash do MCD com `desiredConfig annotation not found`.
+
+```bash
+# Pegar o config do worker pool
+DESIRED=$(oc get node worker-0 -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig}')
+
+# Aplicar no node afetado
+oc annotate node <node-afetado> "machineconfiguration.openshift.io/desiredConfig=${DESIRED}"
+```
+
+### 14.12 Recursos — Masters com memória insuficiente
+
+**Problema:** Com 16 GB de RAM, os masters ficavam com ~84% de uso de memória.
+O `openshift-apiserver` retornava 503 intermitentes, o monitoring não subia completamente,
+e o console ficava inacessível após login.
+
+**Solução:** Aumentar a RAM dos masters para **24 GB** no Proxmox e reiniciar cada master
+(um por vez, com drain/uncordon):
+
+```bash
+# Para cada master (um por vez):
+oc adm drain master-X --ignore-daemonsets --delete-emptydir-data --force
+# No Proxmox: aumentar RAM e reiniciar a VM
+oc wait node/master-X --for=condition=Ready --timeout=10m
+oc adm uncordon master-X
+```
+
+| VM          | RAM original | RAM final | Observação                    |
+|-------------|-------------|-----------|-------------------------------|
+| master-0/1/2| 16 GB       | 24 GB     | Resolve 503s e instabilidade |
+
+### 14.13 Bootstrap — Boot volta para ISO
+
+**Problema:** Após instalar o RHCOS no disco, a VM volta a bootar pela ISO.
+
+**Solução:** No Proxmox, alterar o boot order da VM para disco primeiro,
+ou ejetar a ISO no Hardware > CD/DVD Drive.
+
+### 14.14 Resumo da topologia final (IPs reais vs planejados)
+
+| Node      | IP planejado | IP real          | Motivo da diferença              |
+|-----------|-------------|------------------|----------------------------------|
+| bootstrap | .111        | .111             | OK (DHCP reservado)              |
+| master-0  | .112        | **.116**         | Pegou IP do pool antes da reserva|
+| master-1  | .113        | .113             | OK                               |
+| master-2  | .114        | **.115**         | Pegou IP do pool antes da reserva|
+| worker-0  | .115        | **.117**         | Pegou IP do pool antes da reserva|
+| worker-1  | .116        | **.119**         | Pegou IP do pool antes da reserva|
+| infra-0   | .117        | **.112**         | Pegou IP do pool antes da reserva|
+| infra-1   | .118        | .118             | OK                               |
+
+> **Lição aprendida:** Configure as reservas DHCP no dnsmasq **antes** de criar/bootar
+> os RHCOS nodes, usando os MACs das VMs do Proxmox (`qm config <VMID> | grep net0`).
+
+---
+
 *Guia criado para estudo e laboratório em ambiente Proxmox.*  
+*Instalação realizada com sucesso em 2026-04-13/14.*  
 *Substitua `SEU_IP_PUBLICO` pelo IP público real antes de iniciar.*

@@ -18,7 +18,7 @@
 # Arquivo: rhcos-4.16.x-x86_64-live.x86_64.iso
 # Faça upload no Proxmox em: Datacenter > Storage > local > ISO Images
 # ─────────────────────────────────────────────────────────────────────────────
-rhcos_iso = "local:iso/rhcos-4.16.1-x86_64-live.x86_64.iso"
+rhcos_iso = "vz-folder:iso/rhcos-4.16.51-x86_64-live.x86_64.iso"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bastion — usa clone do template (Linux normal, cloud-init funciona)
@@ -26,7 +26,7 @@ rhcos_iso = "local:iso/rhcos-4.16.1-x86_64-live.x86_64.iso"
 # ─────────────────────────────────────────────────────────────────────────────
 vms = {
   "bastion-ocp" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 2
     memory = 4096
     disk   = 50
@@ -48,7 +48,7 @@ vms = {
 rhcos_vms = {
   # Bootstrap — temporário, destruído após instalação
   "bootstrap" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 4
     memory = 8192
     disk   = 120
@@ -58,7 +58,7 @@ rhcos_vms = {
 
   # Control Plane (etcd + API Server)
   "master-0" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 4
     memory = 16384
     disk   = 120
@@ -66,7 +66,7 @@ rhcos_vms = {
     vmid   = 2011
   }
   "master-1" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 4
     memory = 16384
     disk   = 120
@@ -74,7 +74,7 @@ rhcos_vms = {
     vmid   = 2012
   }
   "master-2" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 4
     memory = 16384
     disk   = 120
@@ -84,7 +84,7 @@ rhcos_vms = {
 
   # Workers — workloads de aplicação
   "worker-0" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 2
     memory = 8192
     disk   = 120
@@ -92,7 +92,7 @@ rhcos_vms = {
     vmid   = 2021
   }
   "worker-1" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 2
     memory = 8192
     disk   = 120
@@ -102,7 +102,7 @@ rhcos_vms = {
 
   # Infra — Ingress Router + Registry + Monitoring
   "infra-0" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 4
     memory = 16384
     disk   = 120
@@ -110,7 +110,7 @@ rhcos_vms = {
     vmid   = 2031
   }
   "infra-1" = {
-    node   = "SEU_NODE"
+    node   = "suhr"
     cores  = 4
     memory = 16384
     disk   = 120
