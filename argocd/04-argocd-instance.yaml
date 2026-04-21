@@ -1,0 +1,41 @@
+apiVersion: argoproj.io/v1beta1
+kind: ArgoCD
+metadata:
+  name: openshift-gitops
+  namespace: openshift-gitops
+spec:
+  # Servidor ArgoCD
+  server:
+    autoscale:
+      enabled: false
+    route:
+      enabled: true   # expõe via Route no OpenShift automaticamente
+
+  # Application Set controller
+  applicationSet:
+    enabled: true
+
+  # Redis (cache)
+  redis:
+    autoscale:
+      enabled: false
+
+  # Repositorios privados: adicione credenciais aqui se necessário
+  # repo:
+  #   volumes: []
+
+  # SSO via OpenShift OAuth (login com credenciais do cluster)
+  sso:
+    dex:
+      openShiftOAuth: true
+    provider: dex
+
+  # RBAC: cluster-admins do OCP viram admins no ArgoCD
+  rbac:
+    defaultPolicy: 'role:readonly'
+    policy: |
+      g, system:cluster-admins, role:admin
+    scopes: '[groups]'
+
+  # Resource tracking
+  resourceTrackingMethod: annotation

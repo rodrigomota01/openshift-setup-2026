@@ -1,0 +1,27 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp
+  # Namespace onde o ArgoCD está rodando (instância padrão do OpenShift GitOps)
+  # NÃO usar openshift-gitops-operator (esse é o namespace do operador OLM)
+  namespace: openshift-gitops
+  labels:
+    app.kubernetes.io/name: myapp
+spec:
+  project: default
+
+  source:
+    repoURL: 'https://github.com/SEU_USUARIO/SEU_REPO.git'
+    targetRevision: main
+    path: manifests   # pasta dentro do repo com os yamls da aplicação
+
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: myapp   # namespace onde os recursos serão criados no cluster
+
+  syncPolicy:
+    automated:
+      prune: true       # remove recursos que foram deletados no git
+      selfHeal: false   # não reverte mudanças manuais no cluster
+    syncOptions:
+      - CreateNamespace=true   # cria o namespace destino se não existir
