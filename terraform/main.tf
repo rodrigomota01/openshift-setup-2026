@@ -16,12 +16,12 @@ provider "proxmox" {
 
 resource "proxmox_virtual_environment_vm" "vms" {
   for_each  = var.vms
-  name      = each.key
+  name      = "atnbr${each.value.vmid}"
   node_name = each.value.node
   vm_id     = each.value.vmid
 
   clone {
-    vm_id        = 9001
+    vm_id        = each.value.template_vmid
     full         = true
     node_name    = each.value.node
     datastore_id = "vz-folder"
@@ -44,8 +44,9 @@ resource "proxmox_virtual_environment_vm" "vms" {
   }
 
   network_device {
-    bridge = "vmbr1"
-    model  = "virtio"
+    bridge  = each.value.bridge
+    model   = "virtio"
+    vlan_id = each.value.vlan_id
   }
 
   initialization {
@@ -53,7 +54,7 @@ resource "proxmox_virtual_environment_vm" "vms" {
     ip_config {
       ipv4 {
         address = each.value.ip
-        gateway = "192.168.100.1"
+        gateway = each.value.gateway
       }
     }
     user_account {
@@ -77,6 +78,22 @@ output "vm_ips" {
   value = { for k, v in var.vms : k => v.ip }
 }
 
+# Inventário Ansible — útil para clusters Kubernetes provisionados via vms{}
+# Uso: terraform output -json ansible_inventory
+output "ansible_inventory" {
+  description = "IPs agrupados por role para uso no inventário Ansible (funciona com clusters k8s)"
+  value = {
+    control_plane = {
+      for k, v in var.vms : k => trimprefix(v.ip, "/24")
+      if can(regex("control-plane", k))
+    }
+    workers = {
+      for k, v in var.vms : k => trimprefix(v.ip, "/24")
+      if can(regex("worker", k))
+    }
+  }
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Nodes RHCOS — bootstrap, masters, workers, infra
 #
@@ -91,7 +108,7 @@ output "vm_ips" {
 # ─────────────────────────────────────────────────────────────────────────────
 resource "proxmox_virtual_environment_vm" "rhcos_vms" {
   for_each  = var.rhcos_vms
-  name      = each.key
+  name      = "atnbr${each.value.vmid}"
   node_name = each.value.node
   vm_id     = each.value.vmid
 

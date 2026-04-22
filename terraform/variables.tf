@@ -9,14 +9,18 @@ variable "ssh_public_key" {
 }
 
 variable "vms" {
-  description = "Map of VMs to create via clone (bastion, LBs) — define per cluster in clusters/<name>.tfvars"
+  description = "Map of VMs to create via clone (bastion, LBs, k8s nodes) — define per cluster in clusters/<name>.tfvars"
   type = map(object({
-    node   = string
-    cores  = number
-    memory = number
-    disk   = number
-    ip     = string
-    vmid   = number
+    node    = string
+    cores   = number
+    memory  = number
+    disk    = number
+    ip      = string
+    vmid    = number
+    gateway      = optional(string, "192.168.100.1")
+    bridge       = optional(string, "vmbr1")
+    vlan_id      = optional(number, null)
+    template_vmid = optional(number, 9001)
   }))
   default = {}
 }
