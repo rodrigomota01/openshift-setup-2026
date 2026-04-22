@@ -1,0 +1,84 @@
+name: Terraform
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Cluster var file (sem extensao, ex: k8s-v1.28)"
+        required: true
+        type: choice
+        options:
+          - k8s-v1.28
+          - ocp-lab
+          - atena
+      action:
+        description: "Acao do Terraform"
+        required: true
+        type: choice
+        default: plan
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  contents: read
+
+env:
+  TF_DIR: terraform
+  TF_VAR_proxmox_token: ${{ secrets.PROXMOX_TOKEN }}
+  TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: us-east-1
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.9"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: Selecionar workspace
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform workspace select -or-create "${{ inputs.cluster }}"
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate
+
+      # ── Plan ────────────────────────────────────────────────────────────
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan \
+            -var-file="clusters/${{ inputs.cluster }}.tfvars" \
+            -out="${{ inputs.cluster }}.tfplan" \
+            -input=false
+
+      # ── Apply ───────────────────────────────────────────────────────────
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false "${{ inputs.cluster }}.tfplan"
+
+      # ── Destroy ─────────────────────────────────────────────────────────
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform destroy \
+            -var-file="clusters/${{ inputs.cluster }}.tfvars" \
+            -auto-approve \
+            -input=false
